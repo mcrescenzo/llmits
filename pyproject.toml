@@ -1,0 +1,72 @@
+# Package metadata and development tool configuration.
+#
+# Zero runtime dependencies is a hard contract (the shipped artifact is a
+# standard-library-only zipapp built by tools/package.py); the dev tools
+# below live in the PEP 735 `dev` dependency group precisely so they can
+# never leak into a runtime install. The version is not duplicated here: it
+# is read dynamically from src/llmits/__init__.py, the single source the
+# zipapp already ships.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmits"
+dynamic = ["version"]
+description = "Terminal dashboard for LLM provider subscription limits"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Environment :: Console",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/mcrescenzo/llmits"
+Repository = "https://github.com/mcrescenzo/llmits"
+Issues = "https://github.com/mcrescenzo/llmits/issues"
+Changelog = "https://github.com/mcrescenzo/llmits/releases"
+Security = "https://github.com/mcrescenzo/llmits/security"
+
+[project.scripts]
+llmits = "llmits.cli:main"
+
+[dependency-groups]
+dev = ["ruff==0.14.14", "mypy==2.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "llmits.__version__"}
+
+[tool.setuptools.package-data]
+llmits = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# `timezone.utc` stays the canonical spelling: switching src/ to the
+# `datetime.UTC` alias (UP017) is pure churn for no behavioral gain.
+ignore = ["UP017"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/llmits"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true

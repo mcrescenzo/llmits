@@ -1,0 +1,11 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "level": "max",
+    "limits": [
+      {"type": "5 Hour", "rawType": "CREDIT_LIMIT", "unit": 3, "number": 5, "percentage": 18, "nextResetTime": 1782956800000},
+      {"type": "Week", "rawType": "CREDIT_LIMIT", "unit": 6, "number": 1, "percentage": 61, "nextResetTime": 1783388800000}
+    ]
+  }
+}

@@ -1,0 +1,62 @@
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Test, coverage, and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.log
+
+# --- Editors and OS -----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Secrets (llmits reads credentials from their home locations; never in-repo)
+.env
+.env.*
+*.pem
+*.key
+
+# --- Local agent and tool state (machine-local, never published) ---------------
+# Beads routing metadata, hooks, and interaction logs; the tracker lives on the
+# shared Dolt server, so nothing under .beads/ is repository content.
+.beads/
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+# Claude Code, Codex, OpenCode, and pi per-repo state and vendored skills.
+.claude/
+.agents/
+.codex/
+.opencode/
+.remember/
+.paseo-managed-files.json
+# Superpowers brainstorm/plan scratch and repo-review run output.
+docs/superpowers/
+.superpowers/
+.repo-review/

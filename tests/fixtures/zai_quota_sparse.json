@@ -1,0 +1,11 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "level": "lite",
+    "limits": [
+      {"type": "5h Token", "rawType": "TOKENS_LIMIT", "unit": 3, "percentage": 2},
+      {"type": "Weekly Token", "rawType": "TOKENS_LIMIT", "unit": 6, "percentage": 33}
+    ]
+  }
+}

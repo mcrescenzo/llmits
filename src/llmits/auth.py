@@ -1,0 +1,467 @@
+"""Provider-neutral, read-only credential discovery.
+
+Providers declare ordered, audience-bound environment or structured-file
+sources. Adding a provider does not require a new file-access path.
+
+Security contract (enforced by tests):
+- Files are opened with O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC.
+- The file must be a regular file owned by the current user, with no group
+  or other permission bits, and at most 1 MiB.
+- Errors never contain tokens or credential paths.
+"""
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tomllib
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Protocol
+
+from .models import AUTH_REQUIRED, ProviderError
+
+MAX_CREDENTIAL_BYTES = 1024 * 1024
+
+# Recovery guidance shared by a provider's per-file sources and its overall
+# missing-credential error, so the two can never drift apart.
+_CLAUDE_RELOGIN_ACTION = (
+    "log in with the Claude Code CLI (claude login), or pass --claude-credentials"
+)
+_CODEX_RELOGIN_ACTION = "log in with the Codex CLI (codex login), or pass --codex-credentials"
+
+# O_NONBLOCK prevents a malicious FIFO at the credential path from blocking
+# the open; it is a no-op for regular files, and non-regular files are
+# rejected by the fstat checks before any read happens.
+_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+class CredentialError(Exception):
+    """A credential could not be securely resolved."""
+
+    def __init__(self, reason: str, action: str) -> None:
+        super().__init__(reason)
+        self.error = ProviderError(code=AUTH_REQUIRED, message=reason, action=action)
+
+
+class CredentialSource(Protocol):
+    """Provider-bound source adapter used by ordered discovery.
+
+    ``audience`` is declared as a read-only property so frozen dataclass
+    sources (whose fields cannot be reassigned) satisfy the protocol; the
+    audience is fixed when a source is constructed and never re-bound.
+    """
+
+    @property
+    def audience(self) -> str: ...
+
+    def resolve(self) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class EnvironmentSource:
+    """One provider-bound environment variable in a precedence chain."""
+
+    audience: str
+    variable: str
+
+    def resolve(self) -> str | None:
+        value = os.environ.get(self.variable)
+        return value.strip() if value and value.strip() else None
+
+
+@dataclass(frozen=True)
+class CredentialSpec:
+    """Ordered credential sources and provider-local missing guidance."""
+
+    provider: str
+    sources: tuple[CredentialSource, ...]
+    missing_message: str
+    missing_action: str
+
+
+def discover_credential(spec: CredentialSpec) -> str:
+    """Return the first usable credential whose audience matches the provider."""
+    for source in spec.sources:
+        if getattr(source, "audience", None) != spec.provider:
+            raise CredentialError(
+                "credential source has the wrong provider audience",
+                "report this internal llmits credential configuration error",
+            )
+        value = source.resolve()
+        if value:
+            return value
+    raise CredentialError(spec.missing_message, spec.missing_action)
+
+
+def _validate_stat(st: os.stat_result, what: str) -> None:
+    if not stat.S_ISREG(st.st_mode):
+        raise CredentialError(
+            f"{what} is not a regular file",
+            f"point the {what} setting at a regular credentials file",
+        )
+    if st.st_uid != os.geteuid():
+        raise CredentialError(
+            f"{what} is not owned by the current user",
+            f"fix ownership of the {what} file (chown)",
+        )
+    if st.st_mode & 0o077:
+        raise CredentialError(
+            f"{what} is readable by group or other users",
+            f"run chmod 600 on the {what} file",
+        )
+    if st.st_size > MAX_CREDENTIAL_BYTES:
+        raise CredentialError(
+            f"{what} is unexpectedly large",
+            f"check that the {what} path points at the real credentials file",
+        )
+
+
+def _secure_read_bytes(path: Path, what: str) -> bytes:
+    """Read a credential-bearing file with all safety checks applied."""
+    try:
+        fd = os.open(path, _OPEN_FLAGS)
+    except OSError:
+        raise CredentialError(
+            f"{what} could not be opened securely",
+            f"check that the {what} path is a regular file you own, not a symlink",
+        ) from None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            raise CredentialError(
+                f"{what} could not be inspected",
+                f"check that the {what} file still exists and is readable",
+            ) from None
+        _validate_stat(st, what)
+        chunks = []
+        total = 0
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                raise CredentialError(
+                    f"{what} could not be read",
+                    f"check permissions on the {what} file",
+                ) from None
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_CREDENTIAL_BYTES:
+                raise CredentialError(
+                    f"{what} is unexpectedly large",
+                    f"check that the {what} path points at the real credentials file",
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def secure_read_json(path: Path, what: str) -> dict:
+    """Securely read a credential-bearing JSON object."""
+    try:
+        payload = json.loads(_secure_read_bytes(path, what).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise CredentialError(
+            f"{what} is not valid JSON",
+            "log in again with the official CLI to recreate the file",
+        ) from None
+    if not isinstance(payload, dict):
+        raise CredentialError(
+            f"{what} has an unexpected format",
+            "log in again with the official CLI to recreate the file",
+        )
+    return payload
+
+
+def secure_read_toml(path: Path, what: str) -> dict:
+    """Securely read a credential-bearing TOML document."""
+    try:
+        payload = tomllib.loads(_secure_read_bytes(path, what).decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise CredentialError(
+            f"{what} is not valid TOML",
+            "reconfigure the official tool to recreate the file",
+        ) from None
+    if not isinstance(payload, dict):
+        raise CredentialError(
+            f"{what} has an unexpected format",
+            "reconfigure the official tool to recreate the file",
+        )
+    return payload
+
+
+@dataclass(frozen=True)
+class StructuredFileSource:
+    """An exact structured file whose extractor also validates provider identity.
+
+    Optional sources are best-effort integrations with other tools: absent,
+    insecure, malformed, or non-matching files are skipped. Strict sources
+    preserve the existing fail-closed behavior for a provider's own auth file.
+    """
+
+    audience: str
+    path: Callable[[], Path]
+    what: str
+    loader: Callable[[Path, str], dict]
+    extract: Callable[[dict], str | None]
+    optional: bool = False
+    missing_action: str = "reconfigure the credential source"
+
+    def resolve(self) -> str | None:
+        path = self.path()
+        if not path.exists():
+            return None
+        try:
+            payload = self.loader(path, self.what)
+        except CredentialError:
+            if self.optional:
+                return None
+            raise
+        value = self.extract(payload)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if self.optional:
+            return None
+        raise CredentialError(
+            f"{self.what} does not contain an access token",
+            self.missing_action,
+        )
+
+
+def _strict_json_source(
+    audience: str,
+    path: Path,
+    what: str,
+    extract: Callable[[dict], str | None],
+    missing_action: str,
+) -> StructuredFileSource:
+    return StructuredFileSource(
+        audience=audience,
+        path=lambda: path,
+        what=what,
+        loader=secure_read_json,
+        extract=extract,
+        missing_action=missing_action,
+    )
+
+
+def _claude_access_token(data: dict) -> str | None:
+    oauth = data.get("claudeAiOauth")
+    return oauth.get("accessToken") if isinstance(oauth, dict) else None
+
+
+def _claude_sources(cli_path: str | None) -> tuple[CredentialSource, ...]:
+    paths: list[Path] = []
+    if cli_path:
+        paths.append(Path(cli_path).expanduser())
+    override = os.environ.get("LLMITS_CLAUDE_CREDENTIALS")
+    if override:
+        paths.append(Path(override).expanduser())
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        paths.append(Path(config_dir).expanduser() / ".credentials.json")
+    paths.append(Path.home() / ".claude" / ".credentials.json")
+    return tuple(
+        _strict_json_source(
+            "claude",
+            path,
+            "Claude credentials file",
+            _claude_access_token,
+            _CLAUDE_RELOGIN_ACTION,
+        )
+        for path in paths
+    )
+
+
+def read_claude_token(cli_path: str | None = None) -> str:
+    return discover_credential(
+        CredentialSpec(
+            provider="claude",
+            sources=_claude_sources(cli_path),
+            missing_message="no Claude credentials file found",
+            missing_action=_CLAUDE_RELOGIN_ACTION,
+        )
+    )
+
+
+def _codex_access_token(data: dict) -> str | None:
+    tokens = data.get("tokens")
+    return tokens.get("access_token") if isinstance(tokens, dict) else None
+
+
+def _codex_sources(cli_path: str | None) -> tuple[CredentialSource, ...]:
+    paths: list[Path] = []
+    if cli_path:
+        paths.append(Path(cli_path).expanduser())
+    override = os.environ.get("LLMITS_CODEX_CREDENTIALS")
+    if override:
+        paths.append(Path(override).expanduser())
+    paths.append(Path.home() / ".codex" / "auth.json")
+    return tuple(
+        _strict_json_source(
+            "codex", path, "Codex auth file", _codex_access_token, _CODEX_RELOGIN_ACTION
+        )
+        for path in paths
+    )
+
+
+def read_codex_token(cli_path: str | None = None) -> str:
+    return discover_credential(
+        CredentialSpec(
+            provider="codex",
+            sources=_codex_sources(cli_path),
+            missing_message="no Codex auth file found",
+            missing_action=_CODEX_RELOGIN_ACTION,
+        )
+    )
+
+
+def _pi_zai_key(data: dict) -> str | None:
+    entry = data.get("zai")
+    if not isinstance(entry, dict) or entry.get("type") != "api_key":
+        return None
+    key = entry.get("key")
+    if not isinstance(key, str):
+        return None
+    # Pi supports shell commands and environment interpolation in this field.
+    # llmits never executes commands and must not treat an unresolved reference
+    # as a credential. Environment variables are handled by earlier sources.
+    if key.startswith(("!", "$")):
+        return None
+    return key
+
+
+_ZAI_CLAUDE_BASE_URLS = frozenset(
+    {"https://api.z.ai/api/anthropic", "https://api.z.ai/api/anthropic/"}
+)
+_ZAI_CODEX_BASE_URLS = frozenset(
+    {"https://api.z.ai/api/v1", "https://api.z.ai/api/v1/"}
+)
+
+
+def _zai_key_from_claude_settings(data: dict) -> str | None:
+    env = data.get("env")
+    if not isinstance(env, dict) or env.get("ANTHROPIC_BASE_URL") not in _ZAI_CLAUDE_BASE_URLS:
+        return None
+    token = env.get("ANTHROPIC_AUTH_TOKEN")
+    return token if isinstance(token, str) else None
+
+
+def _claude_settings_path() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        return Path(configured).expanduser() / "settings.json"
+    return Path.home() / ".claude" / "settings.json"
+
+
+def _zai_key_from_codex_config(data: dict) -> str | None:
+    providers = data.get("model_providers")
+    if not isinstance(providers, dict):
+        return None
+    entry = providers.get("ZAI")
+    if not isinstance(entry, dict) or entry.get("base_url") not in _ZAI_CODEX_BASE_URLS:
+        return None
+    token = entry.get("experimental_bearer_token")
+    return token if isinstance(token, str) else None
+
+
+def _codex_config_path() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser() / "config.toml"
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _zai_sources() -> tuple[CredentialSource, ...]:
+    return (
+        EnvironmentSource("zai", "ZAI_API_KEY"),
+        EnvironmentSource("zai", "ZHIPU_API_KEY"),
+        StructuredFileSource(
+            audience="zai",
+            path=lambda: Path.home() / ".pi" / "agent" / "auth.json",
+            what="Pi auth file",
+            loader=secure_read_json,
+            extract=_pi_zai_key,
+            optional=True,
+        ),
+        StructuredFileSource(
+            audience="zai",
+            path=_claude_settings_path,
+            what="Claude settings file",
+            loader=secure_read_json,
+            extract=_zai_key_from_claude_settings,
+            optional=True,
+        ),
+        StructuredFileSource(
+            audience="zai",
+            path=_codex_config_path,
+            what="Codex config file",
+            loader=secure_read_toml,
+            extract=_zai_key_from_codex_config,
+            optional=True,
+        ),
+    )
+
+
+def read_zai_key() -> str:
+    return discover_credential(
+        CredentialSpec(
+            provider="zai",
+            sources=_zai_sources(),
+            missing_message="Z.AI API key not set or discoverable",
+            missing_action=(
+                "log in to Z.AI through a supported coding tool or export ZAI_API_KEY"
+            ),
+        )
+    )
+
+
+_PROVIDER_CREDENTIAL_READERS: dict[str, Callable[[str | None], str]] = {
+    "claude": read_claude_token,
+    "codex": read_codex_token,
+    "zai": lambda _explicit_path: read_zai_key(),
+}
+
+
+def credential_provider_ids() -> tuple[str, ...]:
+    """Return provider ids with registered credential-discovery specifications."""
+    return tuple(_PROVIDER_CREDENTIAL_READERS)
+
+
+def read_provider_credential(provider: str, explicit_path: str | None = None) -> str:
+    """Resolve one provider's credential through its ordered source specification."""
+    reader = _PROVIDER_CREDENTIAL_READERS.get(provider)
+    if reader is None:
+        raise CredentialError(
+            "no credential discovery specification for provider",
+            "report this internal llmits provider configuration error",
+        )
+    return reader(explicit_path)
+
+
+def default_credential_readers(
+    explicit_paths: Mapping[str, str | None] | None = None,
+) -> dict[str, Callable[[], str]]:
+    """Build a ``{provider: reader}`` map over every registered provider id.
+
+    ``explicit_paths`` supplies a CLI-provided path override per provider id
+    (providers whose reader takes no explicit path, such as Z.AI, simply
+    ignore it). Shared by ``cli._credential_reader_map`` (explicit CLI paths)
+    and ``service.RefreshService``'s default-reader fallback (no explicit
+    paths) so the two never drift on how the map is built.
+    """
+    paths = explicit_paths or {}
+    readers: dict[str, Callable[[], str]] = {}
+    for provider in credential_provider_ids():
+        paths_for_provider = paths.get(provider)
+        readers[provider] = partial(
+            read_provider_credential, provider, explicit_path=paths_for_provider
+        )
+    return readers

@@ -1,0 +1,12 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "level": "pro",
+    "limits": [
+      {"type": "5h Token", "rawType": "TOKENS_LIMIT", "unit": 3, "number": 5, "usage": 1000000, "currentValue": 72000, "remaining": 928000, "percentage": 7, "nextResetTime": 1782956800000},
+      {"type": "Weekly Token", "rawType": "TOKENS_LIMIT", "unit": 6, "number": 7, "usage": 5000000, "currentValue": 2650000, "remaining": 2350000, "percentage": 53, "nextResetTime": 1783388800000},
+      {"type": "MCP usage(1 Month)", "rawType": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 1000, "currentValue": 42, "remaining": 958, "percentage": 4}
+    ]
+  }
+}
