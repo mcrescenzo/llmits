@@ -2,7 +2,7 @@ PY ?= python3
 
 export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH),)
 
-.PHONY: test check lint typecheck format build release-check public-history clean
+.PHONY: test check lint typecheck format build release-check history-check install-hooks public-history clean
 
 test:
 	$(PY) -m unittest discover -s tests -v
@@ -23,7 +23,13 @@ format:
 build:
 	$(PY) tools/package.py --output dist/llmits
 
-release-check: check lint typecheck build
+history-check:
+	$(PY) tools/public_history.py --scan-history --repository .
+
+install-hooks:
+	git config core.hooksPath .githooks
+
+release-check: check lint typecheck history-check build
 	$(PY) -m unittest tests.test_packaging -v
 
 public-history:

@@ -39,6 +39,13 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+*.p12
+*.pfx
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
 
 # --- Local agent and tool state (machine-local, never published) ---------------
 # Beads routing metadata, hooks, and interaction logs; the tracker lives on the

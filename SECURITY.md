@@ -72,13 +72,20 @@ If private advisory reporting is unavailable, open a [public issue](https://gith
 
 Provider endpoint changes that produce a parse error but have no security impact may be reported as ordinary public bugs with sanitized fixtures.
 
-## Maintainer pre-publication checklist
+## Maintainer maintenance and incident checklist
 
-These are required hosting safeguards to verify before making the repository or a release public; this document does not claim they are currently enabled.
+These hosting safeguards and release checks recur: verify them before every release, after any security incident, and at least quarterly. This document does not claim they are currently enabled.
 
-- [ ] Enable private vulnerability reporting and confirm the advisory form is reachable.
-- [ ] Enable GitHub secret scanning and push protection for the repository.
-- [ ] Protect the release branch and require the pinned Python 3.11–3.14 CI matrix.
-- [ ] Run `make release-check` from a clean checkout and record the resulting artifact SHA-256.
+- [ ] Confirm private vulnerability reporting is enabled and the advisory form is reachable.
+- [ ] Confirm GitHub secret scanning and push protection are enabled for the repository.
+- [ ] Protect the release branch and require the pinned Python 3.11–3.14 CI matrix, which checks out full history (`fetch-depth: 0`) and runs the history scan through `make release-check`.
+- [ ] Run `make release-check` — which includes `make history-check`, the full-ancestry scan of commit messages, historical paths, and every unique reachable blob — from a clean checkout and record the resulting artifact SHA-256.
 - [ ] Build the artifact a second time, confirm the bytes and checksum match, and inspect `llmits/LICENSE` in the archive.
 - [ ] Run `make public-history OUTPUT=/path/outside/repository` twice and confirm both candidate commit IDs match; retain its clean-history scan report for review.
+
+Incident response for exposed credentials or account data in repository history:
+
+- Revoke and rotate the credential with its provider before touching repository history.
+- Use the private advisory channel; never reproduce the leaked value in issues, pull requests, or test fixtures.
+- Coordinate any rewrite of published history with all maintainers and announce it; prefer revocation over history erasure when both are possible.
+- After remediation, rerun the recurring checks above — including `make history-check` against a fresh full clone — and re-verify push protection.

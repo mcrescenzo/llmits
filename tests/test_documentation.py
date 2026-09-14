@@ -30,7 +30,7 @@ class PublicDocumentationTests(unittest.TestCase):
         for version in ("3.11", "3.12", "3.13", "3.14"):
             self.assertIn(version, self.security)
 
-    def test_prepublication_checklist_does_not_claim_host_settings_are_enabled(self) -> None:
+    def test_maintainer_checklist_is_recurring_and_names_the_history_gate(self) -> None:
         self.assertIn("does not claim they are currently enabled", self.security)
         for safeguard in (
             "private vulnerability reporting",
@@ -39,6 +39,9 @@ class PublicDocumentationTests(unittest.TestCase):
             "artifact SHA-256",
         ):
             self.assertIn(safeguard, self.security)
+        self.assertIn("make history-check", self.security)
+        self.assertIn("Incident response", self.security)
+        self.assertIn("quarterly", self.security)
 
     def test_readme_describes_runtime_writes_synthetic_fixtures_and_license(self) -> None:
         for contract in (
@@ -77,9 +80,19 @@ class PublicDocumentationTests(unittest.TestCase):
                 self.assertIn("does not require", combined)
             else:
                 self.assertNotIn(machine_specific, combined)
-        for command in ("make check", "make lint", "make typecheck", "make release-check"):
+        for command in (
+            "make check",
+            "make lint",
+            "make typecheck",
+            "make release-check",
+            "make history-check",
+            "make install-hooks",
+        ):
             self.assertIn(command, self.agents)
             self.assertIn(command, self.contributing)
+        self.assertIn("no-reply", self.agents)
+        self.assertIn("noreply.github.com", self.contributing)
+        self.assertIn("GitHub Issues", self.contributing)
 
     def test_project_owned_markdown_links_resolve(self) -> None:
         documents = ("README.md", "SECURITY.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md")

@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import re
+import stat
 import unittest
 from pathlib import Path
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "check.yml"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "check.yml"
+MAKEFILE = REPO_ROOT / "Makefile"
+DEPENDABOT = REPO_ROOT / ".github" / "dependabot.yml"
+PRE_PUSH = REPO_ROOT / ".githooks" / "pre-push"
 ACTION_PIN = re.compile(r"^\s*uses:\s*([^\s@]+)@([0-9a-f]{40})\s+#\s+v\d", re.MULTILINE)
 
 
@@ -38,6 +43,44 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("secrets.", self.text)
         for unsafe in ("git push", "gh release", "workflow_dispatch"):
             self.assertNotIn(unsafe, self.text)
+
+    def test_checkout_fetches_full_history_for_the_history_gate(self):
+        self.assertIn("fetch-depth: 0", self.text)
+        # The canonical gate must run the full-history scan on that checkout.
+        self.assertIn("make release-check PY=python", self.text)
+
+
+class RepositoryHygieneContractTests(unittest.TestCase):
+    """Wiring for the history gate: Makefile targets, hook, and Dependabot."""
+
+    def setUp(self) -> None:
+        self.makefile = MAKEFILE.read_text()
+
+    def test_release_gate_depends_on_history_check(self):
+        self.assertIn("history-check:", self.makefile)
+        self.assertIsNotNone(
+            re.search(r"^release-check:.*\bhistory-check\b", self.makefile, re.MULTILINE)
+        )
+        self.assertIn("tools/public_history.py --scan-history --repository .", self.makefile)
+
+    def test_install_hooks_points_git_at_the_tracked_hooks_directory(self):
+        self.assertIn("install-hooks:", self.makefile)
+        self.assertIn("git config core.hooksPath .githooks", self.makefile)
+
+    def test_pre_push_hook_is_executable_and_runs_both_gates(self):
+        self.assertTrue(PRE_PUSH.is_file())
+        self.assertTrue(PRE_PUSH.stat().st_mode & stat.S_IXUSR)
+        hook = PRE_PUSH.read_text()
+        self.assertIn("make history-check", hook)
+        self.assertIn("make release-check", hook)
+        self.assertIn("set -euo pipefail", hook)
+
+    def test_dependabot_updates_github_actions_weekly(self):
+        dependabot = DEPENDABOT.read_text()
+        self.assertIn("version: 2", dependabot)
+        self.assertIn('package-ecosystem: "github-actions"', dependabot)
+        self.assertIn('interval: "weekly"', dependabot)
+        self.assertIn('directory: "/"', dependabot)
 
 
 if __name__ == "__main__":
