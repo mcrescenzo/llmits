@@ -28,8 +28,17 @@ make check          # compile source and run the full standard-library test suit
 make lint           # Ruff over src/llmits
 make typecheck      # mypy over src/llmits
 make build          # deterministic zipapp at dist/llmits
-make release-check  # complete local release gate
+make release-check  # complete local release gate (includes the history scan)
+make history-check  # scan commit messages, historical paths, and reachable blobs in full HEAD ancestry
+make install-hooks  # point core.hooksPath at the tracked .githooks/ pre-push gate
 make public-history OUTPUT=/tmp/llmits-public-history  # isolated clean-root candidate
 ```
+
+## Public-history hygiene
+
+The repository history is public. Commit with a GitHub no-reply identity (see
+CONTRIBUTING.md), never commit credentials or machine-local state, and run
+`make install-hooks` once per clone so pushes run the same history gate and
+release check as CI. Track public work in GitHub Issues.
 
 Security-sensitive findings belong in the private reporting channel documented in [SECURITY.md](SECURITY.md), not in public issues or test fixtures.

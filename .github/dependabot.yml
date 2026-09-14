@@ -1,0 +1,8 @@
+# Dependabot watches the pinned GitHub Actions and opens reviewable pull
+# requests; those changes pass through the same release gate as any other.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

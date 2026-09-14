@@ -37,7 +37,29 @@ make check
 make lint
 make typecheck
 make build
+make history-check
 ```
+
+`make history-check` scans every commit message, historical path, and unique blob reachable from `HEAD` — including content deleted before the current tip — for credentials, private session URLs, and other prohibited content. It prints a machine-readable report and exits nonzero when it finds anything. It is part of `make release-check`.
+
+## Commit identity and local gates
+
+This repository's history is public. Configure a GitHub no-reply identity before committing so a personal email address never enters the history:
+
+```sh
+git config user.name "Your Name"
+git config user.email "1234567+username@users.noreply.github.com"
+```
+
+GitHub shows your exact no-reply address under *Settings → Emails*. The commands above configure one clone; add `--global` to set it everywhere.
+
+Install the tracked pre-push gate once per clone:
+
+```sh
+make install-hooks
+```
+
+This sets `core.hooksPath` to `.githooks/`, so `git push` first runs the full-history scan and then the complete release gate. Hooks are bypassable with `git push --no-verify`, so they are defense in depth for the person pushing; continuous integration is the authoritative boundary.
 
 ## Change guidelines
 
@@ -48,6 +70,10 @@ make build
 - Add a regression test for behavior changes. Security boundary changes should include a test that fails when the unsafe behavior is restored.
 - Update public documentation when flags, output, supported versions, security behavior, or packaging contracts change.
 - Do not include `dist/`, bytecode, virtual environments, tool caches, credentials, or machine-local agent state in a pull request.
+
+## Task tracking
+
+Bugs, regressions, and feature requests are tracked publicly in [GitHub Issues](https://github.com/mcrescenzo/llmits/issues). Link the issue a pull request addresses, or open one before starting nontrivial work, so every change stays tied to a described problem.
 
 ## Pull requests
 
@@ -66,3 +92,10 @@ make public-history OUTPUT=/tmp/llmits-public-history
 ## Reporting security issues
 
 Do not disclose vulnerabilities, exploits, credentials, account data, or provider responses in a public pull request or issue. Follow the private advisory process in [SECURITY.md](SECURITY.md). Public issues are appropriate only for non-sensitive bugs or for a sanitized request to establish private contact.
+
+If a credential, token, private session URL, or account-derived payload was committed — even in a commit later deleted from the tip:
+
+1. Revoke or rotate the credential with its provider first; repository history is secondary.
+2. Report privately through the advisory process in [SECURITY.md](SECURITY.md) without reproducing the leaked value.
+3. Coordinate any rewrite of published history with a maintainer before pushing it.
+4. Afterward, `make history-check` and `make release-check` must pass from a fresh clone before further work continues.

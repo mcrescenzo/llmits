@@ -4,6 +4,12 @@ The source repository is read only. The candidate is a new one-commit Git
 repository containing the current tracked and non-ignored working tree, so
 converged but not-yet-committed release work is included while local caches,
 agent state, credentials, and build output remain excluded by .gitignore.
+
+The scanner half covers the complete ancestry of HEAD: every commit message,
+every historical path, and every unique reachable blob, including content
+deleted before HEAD. It uses read-only Git plumbing only, and findings name
+the rule and the object identity; matched secret content is never captured
+or printed.
 """
 from __future__ import annotations
 
@@ -14,6 +20,9 @@ import os
 import re
 import stat
 import subprocess
+import sys
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -154,13 +163,222 @@ def scan_bytes(data: bytes, location: str) -> list[ScanFinding]:
     ]
 
 
+_OBJECT_RECORD = re.compile(rb"^([0-9a-f]{40,64})(?: (.*))?$")
+_RAW_OID_LENGTHS = {"sha1": 20, "sha256": 32}
+_BATCH_CHUNK = 256
+
+
+def _object_format(repo: Path) -> str:
+    fmt = _git(repo, "rev-parse", "--show-object-format").decode("ascii").strip()
+    if fmt not in _RAW_OID_LENGTHS:
+        raise RuntimeError(f"unsupported Git object format: {fmt}")
+    return fmt
+
+
+def _batch_read(
+    repo: Path, oids: list[str], *, with_content: bool
+) -> Iterator[tuple[str, str, int, bytes | None]]:
+    """Yield (oid, kind, size, content-or-None) from read-only cat-file plumbing."""
+    for start in range(0, len(oids), _BATCH_CHUNK):
+        window = oids[start : start + _BATCH_CHUNK]
+        request = ("\n".join(window) + "\n").encode("ascii")
+        output = _git(
+            repo,
+            "cat-file",
+            "--batch" if with_content else "--batch-check",
+            input_bytes=request,
+        )
+        pos = 0
+        for oid in window:
+            newline = output.find(b"\n", pos)
+            if newline < 0:
+                raise RuntimeError("cat-file stream ended inside a record header")
+            fields = output[pos:newline].decode("ascii").split(" ")
+            if len(fields) != 3 or fields[0] != oid or not fields[2].isdigit():
+                raise RuntimeError(f"cat-file returned an unusable record for {oid}")
+            kind, size = fields[1], int(fields[2])
+            pos = newline + 1
+            content: bytes | None = None
+            if with_content:
+                end = pos + size
+                if end + 1 > len(output):
+                    raise RuntimeError(f"cat-file stream ended inside object {oid}")
+                content = output[pos:end]
+                pos = end + 1
+            yield oid, kind, size, content
+
+
+def _commit_parts(raw: bytes) -> tuple[str, bytes]:
+    """Return the root tree oid and the message body of a raw commit object."""
+    split = raw.find(b"\n\n")
+    header = raw if split < 0 else raw[:split]
+    message = b"" if split < 0 else raw[split + 2 :]
+    for line in header.split(b"\n"):
+        if line.startswith(b"tree "):
+            return line[5:].decode("ascii"), message
+    raise RuntimeError("commit object has no tree header")
+
+
+def _reachable_object_oids(repo: Path) -> list[str]:
+    """Every object oid reachable from HEAD, in listing order, deduplicated."""
+    oids: list[str] = []
+    seen: set[str] = set()
+    for line in _git(repo, "rev-list", "--objects", "HEAD").split(b"\n"):
+        if not line:
+            continue
+        match = _OBJECT_RECORD.match(line)
+        if match is None:
+            # Only a path containing a newline (or a foreign listing format)
+            # reaches this; fail closed instead of mis-attributing history.
+            raise RuntimeError("rev-list object listing produced an unparseable record")
+        oid = match.group(1).decode("ascii")
+        if oid not in seen:
+            seen.add(oid)
+            oids.append(oid)
+    return oids
+
+
+def _walk_trees(
+    trees: dict[str, bytes], roots: list[str], raw_oid_len: int
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Map every reachable blob to its historical paths; collect gitlink paths."""
+    blob_paths: dict[str, list[str]] = {}
+    gitlink_paths: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    queue: deque[tuple[str, str]] = deque((oid, "") for oid in roots)
+    while queue:
+        oid, prefix = queue.popleft()
+        visit = (oid, prefix)
+        if visit in seen:
+            continue
+        seen.add(visit)
+        data = trees.get(oid)
+        if data is None:
+            raise RuntimeError(f"reachable tree {oid} was not prefetched")
+        pos = 0
+        while pos < len(data):
+            space = data.find(b" ", pos)
+            nul = data.find(b"\0", space + 1)
+            end = nul + 1 + raw_oid_len
+            if space < 0 or nul < 0 or end > len(data):
+                raise RuntimeError(f"tree {oid} contains a truncated entry")
+            mode, name = data[pos:space], data[space + 1 : nul]
+            child = data[nul + 1 : end].hex()
+            child_path = prefix + name.decode("utf-8", "surrogateescape")
+            if mode in (b"40000", b"040000"):
+                queue.append((child, child_path + "/"))
+            elif mode == b"160000":
+                gitlink_paths.append(child_path)
+            else:
+                paths = blob_paths.setdefault(child, [])
+                if child_path not in paths:
+                    paths.append(child_path)
+            pos = end
+    return blob_paths, gitlink_paths
+
+
+def _scan_history(repo: Path) -> tuple[list[ScanFinding], dict[str, int]]:
+    """Scan every commit message, historical path, and unique reachable blob.
+
+    Coverage is the full ancestry of HEAD, so content deleted before HEAD is
+    still inspected. Locations identify the commit or blob object, and a path
+    that itself matched a rule is never echoed back into a location string.
+    """
+    repo = repo.expanduser().resolve()
+    raw_oid_len = _RAW_OID_LENGTHS[_object_format(repo)]
+    commit_oids = _git(repo, "rev-list", "HEAD").decode("ascii").split()
+
+    findings: list[ScanFinding] = []
+    root_trees: list[str] = []
+    for oid, kind, _size, content in _batch_read(repo, commit_oids, with_content=True):
+        if kind != "commit" or content is None:
+            raise RuntimeError(f"object {oid} is not a readable commit")
+        root, message = _commit_parts(content)
+        if root not in root_trees:
+            root_trees.append(root)
+        findings.extend(scan_bytes(message, f"commit {oid}"))
+
+    tree_oids = [
+        oid
+        for oid, kind, _size, _content in _batch_read(
+            repo, _reachable_object_oids(repo), with_content=False
+        )
+        if kind == "tree"
+    ]
+    trees = {
+        oid: content
+        for oid, kind, _size, content in _batch_read(repo, tree_oids, with_content=True)
+        if kind == "tree" and content is not None
+    }
+    blob_paths, gitlink_paths = _walk_trees(trees, root_trees, raw_oid_len)
+
+    flagged_paths: set[str] = set()
+    all_paths: set[str] = set()
+    path_hits: list[ScanFinding] = []
+    for oid, paths in blob_paths.items():
+        for path in paths:
+            all_paths.add(path)
+            hits = scan_bytes(path.encode("utf-8", "surrogateescape"), "")
+            if hits:
+                flagged_paths.add(path)
+                path_hits.extend(
+                    ScanFinding(rule=hit.rule, location=f"historical path (blob {oid})")
+                    for hit in hits
+                )
+    for path in gitlink_paths:
+        all_paths.add(path)
+        path_hits.extend(
+            ScanFinding(rule=hit.rule, location="historical path (gitlink)")
+            for hit in scan_bytes(path.encode("utf-8", "surrogateescape"), "")
+        )
+    findings.extend(path_hits)
+
+    for oid, kind, _size, content in _batch_read(repo, list(blob_paths), with_content=True):
+        if kind != "blob" or content is None:
+            raise RuntimeError(f"object {oid} is not a readable blob")
+        paths = blob_paths[oid]
+        location = (
+            f"blob {oid}"
+            if any(path in flagged_paths for path in paths)
+            else f"blob {oid} at {paths[0]}"
+        )
+        findings.extend(scan_bytes(content, location))
+
+    unique: list[ScanFinding] = []
+    seen_findings: set[tuple[str, str]] = set()
+    for finding in findings:
+        key = (finding.rule, finding.location)
+        if key not in seen_findings:
+            seen_findings.add(key)
+            unique.append(finding)
+    counts = {
+        "commits": len(commit_oids),
+        "historical_paths": len(all_paths),
+        "blobs": len(blob_paths),
+    }
+    return unique, counts
+
+
+def scan_history(repo: Path = REPO_ROOT) -> list[ScanFinding]:
+    findings, _counts = _scan_history(repo)
+    return findings
+
+
+def history_scan_report(repo: Path = REPO_ROOT) -> dict[str, object]:
+    findings, counts = _scan_history(repo)
+    return {
+        "mode": "scan-history",
+        "repository": str(repo.expanduser().resolve()),
+        "commits": counts["commits"],
+        "historical_paths": counts["historical_paths"],
+        "blobs": counts["blobs"],
+        "findings": [{"rule": finding.rule, "location": finding.location} for finding in findings],
+    }
+
+
 def scan_candidate(candidate: Path) -> list[ScanFinding]:
-    findings = scan_bytes(_git(candidate, "log", "--format=%B"), "commit messages")
-    names = _git(candidate, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
-    for raw_name in names:
-        name = raw_name.decode("utf-8", "surrogateescape")
-        blob = _git(candidate, "show", f"HEAD:{name}")
-        findings.extend(scan_bytes(raw_name + b"\0" + blob, name))
+    """Scan a candidate root; by construction its history is one release commit."""
+    findings, _counts = _scan_history(candidate)
     return findings
 
 
@@ -266,10 +484,44 @@ def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Create a deterministic one-commit public-history candidate outside this repository."
+        description=(
+            "Create a deterministic one-commit public-history candidate outside this "
+            "repository, or scan full HEAD history for prohibited content."
+        )
     )
-    parser.add_argument("--output", required=True, type=Path, help="new output directory")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="new output directory for the public-history candidate",
+    )
+    modes.add_argument(
+        "--scan-history",
+        action="store_true",
+        help=(
+            "scan every commit message, historical path, and unique reachable blob "
+            "in HEAD ancestry (including content deleted before HEAD)"
+        ),
+    )
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        default=None,
+        help="repository to scan; applies only to --scan-history (default: this repository)",
+    )
     args = parser.parse_args(argv)
+    if args.scan_history:
+        repo = args.repository if args.repository is not None else REPO_ROOT
+        try:
+            report = history_scan_report(repo)
+        except RuntimeError as error:
+            print(f"history scan failed: {error}", file=sys.stderr)
+            return 2
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if report["findings"] else 0
+    if args.repository is not None:
+        parser.error("--repository applies only to --scan-history")
     report = build_candidate(args.output)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
