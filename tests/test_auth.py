@@ -22,6 +22,8 @@ ISOLATED_ENV_VARS = (
     "CODEX_HOME",
     "ZAI_API_KEY",
     "ZHIPU_API_KEY",
+    "KIMI_API_KEY",
+    "KIMI_CODE_HOME",
     "FIRST_TEST_KEY",
     "SECOND_TEST_KEY",
 )
@@ -561,6 +563,94 @@ class ZaiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
             auth.read_zai_key()
         self.assertIn("Z.AI API key not set", ctx.exception.error.message)
         self.assertIn("ZAI_API_KEY", ctx.exception.error.action)
+
+
+class KimiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
+    @staticmethod
+    def bound_cli_config(token: str) -> str:
+        return (
+            '[providers.kimi-code]\n'
+            'name = "Kimi Code"\n'
+            'base_url = "https://api.kimi.com/coding/v1"\n'
+            f'api_key = "{token}"\n'
+        )
+
+    def test_ignores_ambiguous_kimi_api_key(self):
+        os.environ["KIMI_API_KEY"] = DECOY
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_kimi_key()
+        self.assertNotIn(DECOY, ctx.exception.error.message + ctx.exception.error.action)
+
+    def test_discovers_pi_auth_json_kimi_coding_entry(self):
+        make_creds(
+            self.tmp,
+            ".pi/agent/auth.json",
+            {"kimi-coding": {"type": "api_key", "key": SENTINEL}},
+        )
+        self.assertEqual(auth.read_kimi_key(), SENTINEL)
+
+    def test_refuses_pi_command_and_environment_expressions_and_other_types(self):
+        for payload in (
+            {"kimi-coding": {"type": "api_key", "key": "!printf secret"}},
+            {"kimi-coding": {"type": "api_key", "key": "$OTHER_PROVIDER_KEY"}},
+            {"kimi-coding": {"type": "oauth", "key": SENTINEL}},
+            {"kimi-coding": {"key": SENTINEL}},
+        ):
+            with self.subTest(payload=payload):
+                make_creds(self.tmp, ".pi/agent/auth.json", payload)
+                with self.assertRaises(auth.CredentialError):
+                    auth.read_kimi_key()
+
+    def test_discovers_key_from_cli_config_bound_to_the_coding_base_url(self):
+        write_file(self.tmp, ".kimi-code/config.toml", self.bound_cli_config(SENTINEL))
+        self.assertEqual(auth.read_kimi_key(), SENTINEL)
+
+    def test_cli_config_path_honors_kimi_code_home(self):
+        custom = self.tmp / "custom-home"
+        custom.mkdir()
+        os.environ["KIMI_CODE_HOME"] = str(custom)
+        write_file(custom, "config.toml", self.bound_cli_config(SENTINEL))
+        self.assertEqual(auth.read_kimi_key(), SENTINEL)
+
+    def test_refuses_cli_config_keys_not_bound_to_the_coding_base_url(self):
+        # A pay-as-you-go Moonshot entry (or any other base) must never be
+        # treated as a Kimi Coding Plan key; an entry with no base_url is
+        # skipped too because its default platform is not evidenced.
+        for body in (
+            '[providers.moonshot]\n'
+            'base_url = "https://api.moonshot.ai/v1"\n'
+            f'api_key = "{DECOY}"\n',
+            '[providers.proxied]\n'
+            'base_url = "https://proxy.example/v1"\n'
+            f'api_key = "{DECOY}"\n',
+            '[providers.default]\n' f'api_key = "{DECOY}"\n',
+            '[providers.bound-but-trailing-slashes]\n'
+            'base_url = "https://api.kimi.com/coding/v1//"\n'
+            f'api_key = "{DECOY}"\n',
+        ):
+            with self.subTest(body=body):
+                write_file(self.tmp, ".kimi-code/config.toml", body)
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.read_kimi_key()
+                error = ctx.exception.error
+                self.assertIn("Kimi Coding Plan key not set", error.message)
+                self.assertNotIn(DECOY, error.message + error.action)
+                self.assertNotIn(str(self.tmp), error.message + error.action)
+
+    def test_optional_sources_are_skipped_not_fatal(self):
+        # Insecure permissions, malformed TOML, and a non-table document all
+        # skip the optional kimi sources instead of failing discovery.
+        write_file(self.tmp, ".pi/agent/auth.json", "{}", 0o644)
+        write_file(self.tmp, ".kimi-code/config.toml", "[providers.unclosed\n")
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_kimi_key()
+        self.assertIn("Kimi Coding Plan key not set", ctx.exception.error.message)
+
+    def test_missing_is_actionable(self):
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_kimi_key()
+        self.assertIn("Kimi Coding Plan key not set", ctx.exception.error.message)
+        self.assertIn("kimi-cli", ctx.exception.error.action)
 
 
 if __name__ == "__main__":

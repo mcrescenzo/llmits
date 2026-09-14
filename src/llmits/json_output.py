@@ -64,3 +64,19 @@ def to_document(snapshots, generated_at: datetime | None = None) -> str:
 
 def all_available(snapshots) -> bool:
     return all(snapshot.status == AVAILABLE for snapshot in snapshots)
+
+
+def used_percent_at_least(snapshots, threshold: int) -> bool:
+    """True when any available snapshot's window is used at least ``threshold`` percent.
+
+    The threshold comparison is inclusive (``>=``), so ``--fail-used-percent 0``
+    fires for any provider that reported at least one window. Only available
+    snapshots participate: a provider failure is the exit-1 condition, not a
+    threshold breach.
+    """
+    return any(
+        window.used_percent >= threshold
+        for snapshot in snapshots
+        if snapshot.status == AVAILABLE
+        for window in snapshot.windows
+    )

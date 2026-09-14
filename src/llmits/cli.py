@@ -1,7 +1,9 @@
 """Command-line entry point.
 
 Exit codes: 0 success; 1 a requested provider failed; 2 invalid invocation,
-non-TTY interactive run, or fatal internal error; 130 if the TUI is
+non-TTY interactive run, or fatal internal error; 3 every provider
+succeeded but a window met the ``--fail-used-percent`` threshold (a
+provider failure keeps priority and exits 1); 130 if the TUI is
 interrupted (Ctrl-C).
 """
 from __future__ import annotations
@@ -13,7 +15,15 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 
 from . import __version__, auth
-from .json_output import all_available, to_document
+from .json_output import all_available, to_document, used_percent_at_least
+from .models import (
+    AUTH_REQUIRED,
+    AVAILABLE,
+    NETWORK_ERROR,
+    PARSE_ERROR,
+    RATE_LIMITED,
+    UNAVAILABLE,
+)
 from .providers import PROVIDER_IDS
 from .service import RefreshService
 
@@ -24,12 +34,33 @@ DEFAULT_REFRESH_SECONDS = 300
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llmits",
-        description="Show Claude, Codex, and Z.AI subscription limits in one terminal pane.",
+        description=(
+            "Show Claude, Codex, Z.AI, and Kimi subscription limits in one terminal pane."
+        ),
     )
-    parser.add_argument(
+    output_mode = parser.add_mutually_exclusive_group()
+    output_mode.add_argument(
         "--json",
         action="store_true",
         help="print one JSON snapshot and exit (never starts the TUI)",
+    )
+    output_mode.add_argument(
+        "--diagnose",
+        action="store_true",
+        help=(
+            "check credentials, fixed provider endpoints, and payload compatibility "
+            "without printing secrets, then exit"
+        ),
+    )
+    parser.add_argument(
+        "--fail-used-percent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "with --json: exit 3 when every provider succeeded and any window "
+            "is used at least N percent (0-100); a provider failure still exits 1"
+        ),
     )
     parser.add_argument(
         "--providers",
@@ -83,12 +114,21 @@ def main(
             f"--refresh-seconds must be 0 (disabled) or at least {MIN_REFRESH_SECONDS}"
         )
 
+    if args.fail_used_percent is not None:
+        if not args.json:
+            parser.error("--fail-used-percent requires --json")
+        if not 0 <= args.fail_used_percent <= 100:
+            parser.error("--fail-used-percent must be an integer between 0 and 100")
+
     readers = credential_readers or _credential_reader_map(
         args.claude_credentials, args.codex_credentials
     )
 
     if args.json:
-        return _run_json(provider_ids, transport_factory, readers)
+        return _run_json(provider_ids, transport_factory, readers, args.fail_used_percent)
+
+    if args.diagnose:
+        return _run_diagnose(provider_ids, readers, transport_factory)
 
     if not (sys.stdout.isatty() and sys.stdin.isatty()):
         print(
@@ -100,7 +140,7 @@ def main(
     return _run_tui(provider_ids, transport_factory, readers, args.refresh_seconds)
 
 
-def _run_json(provider_ids, transport_factory, readers) -> int:
+def _run_json(provider_ids, transport_factory, readers, fail_used_percent=None) -> int:
     service = RefreshService(
         provider_ids, transport_factory=transport_factory, credential_readers=readers
     )
@@ -112,7 +152,95 @@ def _run_json(provider_ids, transport_factory, readers) -> int:
     finally:
         service.close()
     print(to_document(snapshots))
-    return 0 if all_available(snapshots) else 1
+    if not all_available(snapshots):
+        return 1  # a provider failure outranks the threshold result
+    if fail_used_percent is not None and used_percent_at_least(snapshots, fail_used_percent):
+        return 3
+    return 0
+
+
+_DIAGNOSTIC_OUTCOMES: Mapping[str, tuple[str, str]] = {
+    AVAILABLE: ("endpoint reachable", "payload compatible"),
+    AUTH_REQUIRED: ("endpoint rejected credential", "payload not checked"),
+    UNAVAILABLE: ("endpoint unavailable", "payload not checked"),
+    RATE_LIMITED: ("endpoint rate limited", "payload not checked"),
+    NETWORK_ERROR: ("endpoint unreachable", "payload not checked"),
+    PARSE_ERROR: ("endpoint reachable", "payload incompatible"),
+}
+
+
+def _constant_reader(value: str) -> Callable[[], str]:
+    """Return an in-memory reader so diagnostics resolve each credential once."""
+
+    def read() -> str:
+        return value
+
+    return read
+
+
+def _run_diagnose(provider_ids, readers, transport_factory=None) -> int:
+    """Secret-safe credential, endpoint, and payload compatibility checks.
+
+    Credentials are resolved once through the production readers, retained
+    only in memory for this invocation, and passed through the ordinary
+    fixed-host refresh path. Every output phrase is local and fixed: tokens,
+    paths, source names, provider bodies, and exception text are never
+    rendered. A missing credential skips that provider's endpoint entirely.
+    """
+    resolved: dict[str, Callable[[], str]] = {}
+    credential_available: dict[str, bool] = {}
+    for provider_id in provider_ids:
+        reader = readers.get(provider_id)
+        try:
+            token = reader() if reader is not None else ""
+        except Exception:
+            token = ""
+        available = isinstance(token, str) and bool(token)
+        credential_available[provider_id] = available
+        if available:
+            resolved[provider_id] = _constant_reader(token)
+
+    snapshots = {}
+    if resolved:
+        service = RefreshService(
+            tuple(resolved),
+            transport_factory=transport_factory,
+            credential_readers=resolved,
+        )
+        try:
+            snapshots = {snapshot.provider: snapshot for snapshot in service.refresh()}
+        except Exception:
+            # A transport-construction or orchestration failure is reported
+            # with fixed local text for every affected provider.
+            snapshots = {}
+        finally:
+            service.close()
+
+    version = sys.version_info
+    print(
+        f"llmits {__version__} · Python {version.major}.{version.minor}.{version.micro} "
+        f"· {sys.platform}"
+    )
+    every_usable = True
+    for provider_id in provider_ids:
+        if not credential_available[provider_id]:
+            credential = "credential unavailable"
+            endpoint, payload = "endpoint not checked", "payload not checked"
+            every_usable = False
+        else:
+            credential = "credential available"
+            snapshot = snapshots.get(provider_id)
+            if snapshot is None:
+                endpoint, payload = "endpoint check failed", "payload not checked"
+                every_usable = False
+            else:
+                endpoint, payload = _DIAGNOSTIC_OUTCOMES.get(
+                    snapshot.status, ("endpoint check failed", "payload not checked")
+                )
+                if snapshot.status != AVAILABLE:
+                    every_usable = False
+        print(f"{provider_id}: {credential} · {endpoint} · {payload}")
+    return 0 if every_usable else 1
 
 
 def _run_tui(provider_ids, transport_factory, readers, refresh_seconds: int) -> int:

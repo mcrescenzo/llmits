@@ -1,6 +1,6 @@
 """Fixed-host HTTPS transport with hard safety properties.
 
-- Only three allowlisted hosts may be contacted; hosts and paths are
+- Only the allowlisted hosts may be contacted; hosts and paths are
   constants inside the provider adapters and can never be influenced by
   CLI options or environment variables.
 - TLS verification is always enabled; the default context is built by
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 1024 * 1024
-ALLOWED_HOSTS = frozenset({"api.anthropic.com", "chatgpt.com", "api.z.ai"})
+ALLOWED_HOSTS = frozenset({"api.anthropic.com", "chatgpt.com", "api.z.ai", "api.kimi.com"})
 
 
 class TransportError(Exception):
