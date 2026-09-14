@@ -27,8 +27,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(
             pins,
             [
-                ("actions/checkout", "11bd71901bbe5b1630ceea73d27597364c9af683"),
-                ("actions/setup-python", "a26af69be951a213d495a4c3e4e4022e16d87065"),
+                ("actions/checkout", "3d3c42e5aac5ba805825da76410c181273ba90b1"),
+                ("actions/setup-python", "5fda3b95a4ea91299a34e894583c3862153e4b97"),
             ],
         )
 
