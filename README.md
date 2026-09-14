@@ -67,12 +67,12 @@ Grammar: exactly one ASCII line on stdout, tokens `<provider>=<state>` joined by
 
 `--overview` exits `0` when every requested provider is available (a stale retained snapshot still counts as available), `1` when any provider failed, and `2` on invalid invocation or a fatal internal error; `--overview` never exits `3`, and `--fail-used-percent` stays `--json`-only.
 
-TUI: the footer is pinned to the last row — `r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all` — and the arrow keys scroll like `j`/`k`. `tab` (and shift-tab) moves the `> ` focus marker between cards and scrolls it into view; `R` refreshes only the focused provider while `r` refreshes every visible one; `h` hides the focused card (hidden cards are excluded from `r` refreshes), `c` collapses it to a header-only card, and `a` restores every hidden and collapsed card and refreshes them all. The state is session-only and never persisted. The terminal must be at least 60×15, the size at which the card stack is scrollable so every requested provider stays reachable. Compact mode depends on width alone: 80 columns or fewer drops the local reset clock and per-window token counts from the bar rows, regardless of height. Bar glyphs are Unicode (`━ ─ ● ○ · …`) when the terminal locale's codeset is UTF-8, else plain ASCII (`= - * o - ...`); `locale.setlocale(LC_ALL, "")` runs first, and the choice follows that C-library locale rather than Python's own stdout encoding, so a forced `LC_ALL=C` gets ASCII instead of a corrupted screen.
+TUI: the footer is pinned to the last row and shows only applicable controls. The `j/k scroll` hint appears only when the card stack exceeds the viewport; the arrow keys scroll like `j`/`k`. `tab` (and shift-tab) moves the `> ` focus marker between cards and scrolls it into view; `R` refreshes only the focused provider while `r` refreshes every visible one; `h` hides the focused card (hidden cards are excluded from `r` refreshes), `c` collapses it to a header-only card, and `a` restores every hidden and collapsed card and refreshes them all. The state is session-only and never persisted. The terminal must be at least 60×15, the size at which the card stack is scrollable so every requested provider stays reachable. Compact mode depends on width alone: 80 columns or fewer drops the local reset clock and per-window token counts from the bar rows, regardless of height. Bar glyphs are Unicode (`━ ─ ● ○ · …`) when the terminal locale's codeset is UTF-8, else plain ASCII (`= - * o - ...`); `locale.setlocale(LC_ALL, "")` runs first, and the choice follows that C-library locale rather than Python's own stdout encoding, so a forced `LC_ALL=C` gets ASCII instead of a corrupted screen.
 
 Sample render at 80 columns, from the test fixtures (no live data or credentials involved):
 
 ```
-llmits v0.3.0  ·  updated 12s ago  ·  next refresh 4:48
+llmits v0.3.1  ·  updated 12s ago  ·  next refresh 4:48
 
 > Claude  [Claude Pro/Max]  ● 12s ago
   5h      ━━━━━━━━━━━━━━━━━───────────────────────   42%  resets now
@@ -89,7 +89,7 @@ Z.AI  [Z.AI pro]  ● stale · 6m ago
   5h      ━━━─────────────────────────────────────    7%  resets now
   last update failed: provider server error (HTTP 503)
 
-r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all
+r/R refresh  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all
 ```
 
 Exit codes: `0` success, `1` a requested provider failed (this outranks the threshold result), `2` invalid invocation, non-TTY interactive run, or a fatal internal error, `3` every requested provider succeeded but a window met the `--fail-used-percent` threshold (`--json`-only; `--overview` never exits `3`), `130` if the TUI is interrupted (Ctrl-C).

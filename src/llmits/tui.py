@@ -407,19 +407,22 @@ def _header_text(view: TuiView, glyphs: Glyphs) -> str:
     return _join_wide(parts, glyphs)
 
 
-def _footer_text(view: TuiView, glyphs: Glyphs) -> str:
-    """Row H-1, pinned: the key hints, with a refreshing prefix in flight.
+def _footer_text(view: TuiView, glyphs: Glyphs, *, scrollable: bool) -> str:
+    """Row H-1, pinned: only currently actionable key hints.
 
-    The newest keys go last so a narrow terminal clips them — not ``q/esc
-    quit`` — while 80 columns still show through ``c collapse``.
+    ``j/k scroll`` is omitted when the card stack fits in the viewport, so
+    the footer never promises movement that cannot occur. The newest keys
+    go last so a narrow terminal clips them — not ``q/esc quit`` — while
+    80 columns still show through ``c collapse``.
     """
     parts = []
     if view.loading:
         parts.append(f"refreshing{glyphs.ellipsis}")
+    parts.append("r/R refresh")
+    if scrollable:
+        parts.append("j/k scroll")
     parts.extend(
         [
-            "r/R refresh",
-            "j/k scroll",
             "q/esc quit",
             "tab focus",
             "h hide",
@@ -533,7 +536,12 @@ def render(view: TuiView, width: int, height: int, glyphs: Glyphs = UNICODE_GLYP
     lines.extend(_clip(line, limit) for line in visible)
     while len(lines) < height - 1:
         lines.append([])
-    lines.append(_clip([Segment(_footer_text(view, glyphs), STYLE_DIM)], limit))
+    lines.append(
+        _clip(
+            [Segment(_footer_text(view, glyphs, scrollable=max_scroll > 0), STYLE_DIM)],
+            limit,
+        )
+    )
     return Frame(lines=lines, max_scroll=max_scroll, offset=offset)
 
 

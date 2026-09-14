@@ -85,7 +85,7 @@ class ArgValidationTests(unittest.TestCase):
     def test_version_prints_version(self):
         code, out, err = self.run_cli(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("llmits 0.3.0", out)
+        self.assertIn("llmits 0.3.1", out)
 
     def test_unknown_provider_exits_two(self):
         code, out, err = self.run_cli(["--json", "--providers", "claude,grok"])

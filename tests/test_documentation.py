@@ -53,6 +53,9 @@ class PublicDocumentationTests(unittest.TestCase):
         ):
             self.assertIn(contract, self.readme)
 
+    def test_readme_explains_scroll_hint_is_contextual(self) -> None:
+        self.assertIn("The `j/k scroll` hint appears only when", self.readme)
+
     def test_readme_documents_opencode_go_without_claiming_zen_balance(self) -> None:
         for contract in (
             "**OpenCode Go**",
