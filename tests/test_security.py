@@ -210,9 +210,14 @@ class CallTests(unittest.TestCase):
 
 
 class HardcodedEndpointTests(unittest.TestCase):
-    def test_transport_allowlist_is_exactly_three_hosts(self):
+    def test_transport_allowlist_covers_every_provider_host(self):
         http_source = (SRC / "http.py").read_text()
-        for host in ("api.anthropic.com", "chatgpt.com", "api.z.ai"):
+        for host in (
+            "api.anthropic.com",
+            "chatgpt.com",
+            "api.z.ai",
+            "api.kimi.com",
+        ):
             self.assertIn(host, http_source)
         self.assertNotIn("http://", http_source.replace("https://", ""))
         self.assertNotIn("evil", http_source)
@@ -222,6 +227,7 @@ class HardcodedEndpointTests(unittest.TestCase):
             ("claude.py", "api.anthropic.com", "/api/oauth/usage"),
             ("codex.py", "chatgpt.com", "/backend-api/wham/usage"),
             ("zai.py", "api.z.ai", "/api/monitor/usage/quota/limit"),
+            ("kimi.py", "api.kimi.com", "/coding/v1/usages"),
         ):
             source = (SRC / "providers" / module).read_text()
             self.assertIn(f'HOST = "{host}"', source)
@@ -267,7 +273,7 @@ def _segments(snapshots, width: int, height: int) -> list[str]:
         loading=False,
         last_refresh=NOW,
         refresh_seconds=300,
-        version="0.1.0",
+        version="0.2.0",
         now=NOW,
     )
     return [segment.text for line in tui.render(view, width, height) for segment in line]

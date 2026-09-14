@@ -89,6 +89,15 @@ class TuiView:
     now: datetime
     scroll: int = 0
     last_error: str | None = None
+    # Session-local card state: providers hidden with ``h`` (excluded from
+    # rendering and from ``r`` refreshes), providers collapsed with ``c``
+    # (header-only cards), the focused provider id (``tab``), and whether
+    # the next render should bring the focused card on screen. All default
+    # to "nothing hidden/collapsed/focused" so older callers are unchanged.
+    hidden: frozenset[str] = frozenset()
+    collapsed: frozenset[str] = frozenset()
+    focus: str | None = None
+    reveal_focus: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,12 +107,17 @@ class Frame:
     Behaves like the ``list[list[Segment]]`` ``render()`` used to return —
     iterable, sized, indexable and sliceable over ``lines`` — so a caller
     that only ever consumed the lines (``_draw``, ``tests/test_security.py``)
-    keeps working unchanged; new callers use ``.lines`` and ``.max_scroll``
-    explicitly.
+    keeps working unchanged; new callers use ``.lines``, ``.max_scroll``,
+    and ``.offset`` explicitly.
     """
 
     lines: list[list[Segment]]
     max_scroll: int
+    # The scroll offset this frame actually applied: the clamped
+    # ``view.scroll``, nudged when ``view.reveal_focus`` pulled the focused
+    # card's header into view. Callers that own scroll state should adopt
+    # this after drawing so their state matches what is on screen.
+    offset: int = 0
 
     def __iter__(self):
         return iter(self.lines)
@@ -311,9 +325,17 @@ def _status_segments(snapshot: ProviderSnapshot, glyphs: Glyphs, now: datetime) 
     return [Segment(f"{glyphs.dot} {word}", STYLE_HIGH)]
 
 
-def _card_header(name: str, plan_name: str | None, status_segments: list[Segment]) -> list[Segment]:
-    """``{Name}  [{plan}]  {status group}``; the bracket is omitted when plan_name is None."""
-    segments = [Segment(name, STYLE_ACCENT)]
+def _card_header(
+    name: str, plan_name: str | None, status_segments: list[Segment], *, focused: bool = False
+) -> list[Segment]:
+    """``{> }{Name}  [{plan}]  {status group}``; the bracket is omitted when plan_name is None.
+
+    The focused card's plain-ASCII ``"> "`` prefix is a session-local marker
+    (never provider-derived text), so it survives ``ASCII_GLYPHS`` mode and
+    the codepoint-clipping below unchanged.
+    """
+    segments = [Segment("> ", STYLE_ACCENT)] if focused else []
+    segments.append(Segment(name, STYLE_ACCENT))
     if plan_name:
         segments.append(Segment(f"  [{plan_name}]", STYLE_DIM))
     segments.append(Segment("  "))
@@ -328,9 +350,20 @@ def _card_lines(
     label_width: int,
     bar_width: int,
     compact: bool,
+    *,
+    collapsed: bool = False,
+    focused: bool = False,
 ) -> list[list[Segment]]:
     name = display_name(snapshot.provider)
-    lines = [_card_header(name, snapshot.plan_name, _status_segments(snapshot, glyphs, now))]
+    lines = [
+        _card_header(
+            name, snapshot.plan_name, _status_segments(snapshot, glyphs, now), focused=focused
+        )
+    ]
+    if collapsed:
+        # A collapsed card keeps its header (status still readable) but
+        # shows no window or error rows.
+        return lines
 
     if snapshot.status == AVAILABLE or snapshot.stale:
         for window in snapshot.windows:
@@ -375,11 +408,25 @@ def _header_text(view: TuiView, glyphs: Glyphs) -> str:
 
 
 def _footer_text(view: TuiView, glyphs: Glyphs) -> str:
-    """Row H-1, pinned: the key hints, with a refreshing prefix in flight."""
+    """Row H-1, pinned: the key hints, with a refreshing prefix in flight.
+
+    The newest keys go last so a narrow terminal clips them — not ``q/esc
+    quit`` — while 80 columns still show through ``c collapse``.
+    """
     parts = []
     if view.loading:
         parts.append(f"refreshing{glyphs.ellipsis}")
-    parts.extend(["r refresh", "j/k scroll", "q/esc quit"])
+    parts.extend(
+        [
+            "r/R refresh",
+            "j/k scroll",
+            "q/esc quit",
+            "tab focus",
+            "h hide",
+            "c collapse",
+            "a show all",
+        ]
+    )
     return _join_wide(parts, glyphs)
 
 
@@ -414,9 +461,14 @@ def render(view: TuiView, width: int, height: int, glyphs: Glyphs = UNICODE_GLYP
     Row 0 is the DIM header, row 1 is blank, the footer is pinned to the
     last row, and everything between is the scrollable card stack — sliced
     by the clamped ``view.scroll`` offset so every provider stays reachable
-    at the documented 60x15 minimum. Every returned line is clipped to
-    ``width - 1`` columns; the returned ``Frame`` also carries ``max_scroll``
-    so a caller can clamp its own scroll state against it.
+    at the documented 60x15 minimum. Hidden providers (``view.hidden``)
+    drop out of the stack entirely; collapsed ones (``view.collapsed``)
+    keep only their header; the focused provider's header carries the
+    ``"> "`` marker. When ``view.reveal_focus`` is set, the applied offset
+    is nudged so the focused card's header lands inside the viewport.
+    Every returned line is clipped to ``width - 1`` columns; the returned
+    ``Frame`` also carries ``max_scroll`` and the effective ``offset`` so a
+    caller can keep its own scroll state in sync with what was drawn.
     """
     limit = max(0, width - 1)
     if width < MIN_COLS or height < MIN_ROWS:
@@ -424,27 +476,57 @@ def render(view: TuiView, width: int, height: int, glyphs: Glyphs = UNICODE_GLYP
         return Frame(lines=[_clip([Segment(message, STYLE_HIGH)], limit)], max_scroll=0)
 
     compact = width <= COMPACT_COLS
-    snapshots = view.snapshots
+    visible_ids = tuple(pid for pid in view.provider_ids if pid not in view.hidden)
+    focus_row: int | None = None
     content: list[list[Segment]] = []
     if view.last_error is not None:
         content.append([Segment(view.last_error, STYLE_HIGH)])
         content.append([])
-    if snapshots is None:
-        for provider_id in view.provider_ids:
+    if not visible_ids:
+        # Fixed local text: provider ids are compile-time constants, so no
+        # provider-derived string can reach this line.
+        content.append(
+            [Segment(f"all providers hidden {glyphs.sep} press a to restore", STYLE_DIM)]
+        )
+    elif view.snapshots is None:
+        for provider_id in visible_ids:
             status = [Segment(f"{glyphs.hollow} fetching{glyphs.ellipsis}", STYLE_DIM)]
-            content.append(_card_header(display_name(provider_id), None, status))
+            focused = provider_id == view.focus
+            if focused:
+                focus_row = len(content)
+            content.append(_card_header(display_name(provider_id), None, status, focused=focused))
             content.append([])
     else:
-        label_width = _label_width(snapshots)
-        max_meta_len = _max_meta_len(snapshots, view.now, compact, glyphs)
+        visible_snapshots = tuple(s for s in view.snapshots if s.provider not in view.hidden)
+        label_width = _label_width(visible_snapshots)
+        max_meta_len = _max_meta_len(visible_snapshots, view.now, compact, glyphs)
         bar_width = _bar_width(width, label_width, max_meta_len)
-        for snapshot in snapshots:
-            content.extend(_card_lines(snapshot, glyphs, view.now, label_width, bar_width, compact))
+        for snapshot in visible_snapshots:
+            focused = snapshot.provider == view.focus
+            if focused:
+                focus_row = len(content)
+            content.extend(
+                _card_lines(
+                    snapshot,
+                    glyphs,
+                    view.now,
+                    label_width,
+                    bar_width,
+                    compact,
+                    collapsed=snapshot.provider in view.collapsed,
+                    focused=focused,
+                )
+            )
             content.append([])
 
     body_height = max(0, height - 3)
     max_scroll = max(0, len(content) - body_height)
     offset = min(max(view.scroll, 0), max_scroll)
+    if view.reveal_focus and focus_row is not None and body_height > 0:
+        if focus_row < offset:
+            offset = focus_row
+        elif focus_row >= offset + body_height:
+            offset = min(max(0, focus_row - body_height + 1), max_scroll)
     visible = content[offset : offset + body_height]
 
     lines = [_clip([Segment(_header_text(view, glyphs), STYLE_DIM)], limit), []]
@@ -452,7 +534,7 @@ def render(view: TuiView, width: int, height: int, glyphs: Glyphs = UNICODE_GLYP
     while len(lines) < height - 1:
         lines.append([])
     lines.append(_clip([Segment(_footer_text(view, glyphs), STYLE_DIM)], limit))
-    return Frame(lines=lines, max_scroll=max_scroll)
+    return Frame(lines=lines, max_scroll=max_scroll, offset=offset)
 
 
 class AppController:
@@ -474,6 +556,8 @@ class AppController:
         self.refresh_seconds = refresh_seconds
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._future: Future | None = None
+        self._refresh_ids: tuple[str, ...] = ()  # ids the in-flight refresh covers
+        self._restore_pending = False  # `a` pressed while a refresh was in flight
         self.snapshots: tuple[ProviderSnapshot, ...] | None = None
         self.loading = False
         self.last_refresh: datetime | None = None
@@ -482,31 +566,108 @@ class AppController:
         self.quit = False
         self.scroll = 0
         self._scroll_cap = 512
+        # Session-local card state; mutated only on the curses loop thread,
+        # like scroll, so no locking is needed.
+        self.hidden: set[str] = set()
+        self.collapsed: set[str] = set()
+        self.focus: str | None = self.provider_ids[0]
+        self._reveal_focus = False
 
     @property
     def provider_ids(self) -> tuple[str, ...]:
         return self._service.provider_ids
 
+    @property
+    def visible_ids(self) -> tuple[str, ...]:
+        """Configured provider ids in order, minus those hidden with ``h``."""
+        return tuple(pid for pid in self.provider_ids if pid not in self.hidden)
+
     def start(self) -> None:
-        self._submit()
+        self._submit(self.visible_ids)
 
     def request_refresh(self) -> None:
-        self._submit()
+        """Refresh every visible (non-hidden) provider."""
+        self._submit(self.visible_ids)
 
-    def _submit(self) -> None:
+    def request_focused_refresh(self) -> None:
+        """Refresh only the focused provider (``R``)."""
+        if self.focus is not None and self.focus in self.visible_ids:
+            self._submit((self.focus,))
+
+    def cycle_focus(self, backward: bool = False) -> None:
+        """Move focus to the next (or previous) visible provider, wrapping."""
+        visible = self.visible_ids
+        if not visible:
+            return
+        if self.focus not in visible:
+            self.focus = visible[-1] if backward else visible[0]
+        else:
+            index = visible.index(self.focus)
+            step = -1 if backward else 1
+            self.focus = visible[(index + step) % len(visible)]
+        self._reveal_focus = True
+
+    def hide_focused(self) -> None:
+        """Hide the focused card (``h``); focus moves to the next visible one."""
+        visible = self.visible_ids
+        if self.focus is None or self.focus not in visible:
+            return
+        index = visible.index(self.focus)
+        self.hidden.add(self.focus)
+        remaining = self.visible_ids
+        if not remaining:
+            self.focus = None
+        else:
+            self.focus = remaining[min(index, len(remaining) - 1)]
+            self._reveal_focus = True
+
+    def show_all(self) -> None:
+        """Restore every hidden and collapsed card (``a``) and refresh them all.
+
+        Unlike ``r``/``R``, the post-restore full refresh is never silently
+        dropped while another refresh is in flight: it is deferred and
+        submitted as soon as ``poll()`` adopts the in-flight one, so every
+        restored provider really is refreshed.
+        """
+        self.hidden.clear()
+        self.collapsed.clear()
+        ids = self.visible_ids
+        if self.focus not in ids:
+            self.focus = ids[0] if ids else None
+            self._reveal_focus = self.focus is not None
+        if not ids:
+            return
         if self._future is not None and not self._future.done():
-            return  # suppress overlapping refreshes
+            self._restore_pending = True
+            return
+        self._submit(ids)
+
+    def toggle_collapse_focused(self) -> None:
+        """Collapse/expand the focused card to/from a header-only card (``c``)."""
+        if self.focus is not None and self.focus in self.visible_ids:
+            if self.focus in self.collapsed:
+                self.collapsed.discard(self.focus)
+            else:
+                self.collapsed.add(self.focus)
+
+    def _submit(self, provider_ids) -> None:
+        ids = tuple(provider_ids)
+        if not ids:
+            return  # nothing rendered -> nothing to refresh
+        if self._future is not None and not self._future.done():
+            return  # suppress overlapping refreshes; the pending set wins
         self.loading = True
+        self._refresh_ids = ids
         future: Future = Future()
         self._future = future
         threading.Thread(
             target=self._run_refresh,
-            args=(future,),
+            args=(future, ids),
             name="llmits-tui-refresh",
             daemon=True,
         ).start()
 
-    def _run_refresh(self, future: Future) -> None:
+    def _run_refresh(self, future: Future, provider_ids) -> None:
         """Run one refresh on a daemon thread and resolve ``future`` with it.
 
         Never lets an exception escape the thread: any failure from
@@ -515,7 +676,7 @@ class AppController:
         it being silently lost off the curses loop thread.
         """
         try:
-            result = self._service.refresh()
+            result = self._service.refresh(provider_ids)
         except Exception as exc:  # defensive: a refresh failure must not crash the app
             future.set_exception(exc)
         else:
@@ -525,6 +686,7 @@ class AppController:
         now = now or self._now_fn()
         if self._future is not None and self._future.done():
             future, self._future = self._future, None
+            covered, self._refresh_ids = self._refresh_ids, ()
             self.loading = False
             self.last_attempt = now
             try:
@@ -535,40 +697,66 @@ class AppController:
                 # good data stays on screen.
                 self.last_error = f"refresh failed: {type(exc).__name__}"
             else:
-                self.snapshots = tuple(snapshots)
+                # Merge, not replace: a subset refresh (``R`` refreshes only
+                # the focused provider) returns snapshots for exactly the
+                # ids it covered, so every other provider keeps its last
+                # adopted snapshot and the merged list stays in the
+                # configured provider order.
+                covered_set = set(covered)
+                fresh = {snapshot.provider: snapshot for snapshot in snapshots}
+                previous = {snapshot.provider: snapshot for snapshot in self.snapshots or ()}
+                merged = []
+                for provider_id in self.provider_ids:
+                    if provider_id in fresh:
+                        merged.append(fresh[provider_id])
+                    elif provider_id in previous and provider_id not in covered_set:
+                        merged.append(previous[provider_id])
+                self.snapshots = tuple(merged)
                 self.last_refresh = now
                 self.last_error = None
+            restore, self._restore_pending = self._restore_pending, False
+            if restore:
+                # A restore pressed while this refresh was in flight: its
+                # full refresh was deferred, not dropped — submit it now.
+                self._submit(self.visible_ids)
         if (
             not self.loading
             and self.refresh_seconds > 0
             and self.last_attempt is not None
             and now >= self.last_attempt + timedelta(seconds=self.refresh_seconds)
         ):
-            self._submit()
+            self._submit(self.visible_ids)
 
     def handle_key(self, key: int) -> None:
         if key in (ord("q"), ord("Q"), 27):
             self.quit = True
-        elif key in (ord("r"), ord("R")):
+        elif key in (ord("\t"), curses.KEY_BTAB):
+            self.cycle_focus(backward=key == curses.KEY_BTAB)
+        elif key == ord("r"):
             self.request_refresh()
+        elif key == ord("R"):
+            self.request_focused_refresh()
+        elif key in (ord("h"), ord("H")):
+            self.hide_focused()
+        elif key in (ord("a"), ord("A")):
+            self.show_all()
+        elif key in (ord("c"), ord("C")):
+            self.toggle_collapse_focused()
         elif key in (curses.KEY_DOWN, ord("j")):
             self.scroll = min(self.scroll + 1, self._scroll_cap)
         elif key in (curses.KEY_UP, ord("k")):
             self.scroll = max(self.scroll - 1, 0)
 
-    def clamp_scroll(self, max_scroll: int) -> None:
-        """Pull ``scroll`` back to ``max_scroll`` after a draw (spec section 7).
-
-        Without this, ``scroll`` can run all the way to ``_scroll_cap``
-        while the viewport silently clamps at render time, and the user has
-        to press ``k`` dozens of times before anything visibly moves. This
-        keeps the controller's own idea of ``scroll`` in sync with the last
-        frame's content, so a single ``k`` responds immediately.
-        """
-        self.scroll = max(0, min(self.scroll, max_scroll))
-
     def view(self, now: datetime | None = None) -> TuiView:
+        """Build the next render input, consuming the pending reveal request.
+
+        ``reveal_focus`` is one-shot: the first ``view()`` after a focus move
+        asks ``render`` to bring the focused card on screen, later views do
+        not, so manual scrolling stays free once the focus is visible.
+        """
         now = now or self._now_fn()
+        reveal = self._reveal_focus
+        self._reveal_focus = False
         return TuiView(
             provider_ids=self.provider_ids,
             snapshots=self.snapshots,
@@ -579,6 +767,10 @@ class AppController:
             now=now,
             scroll=self.scroll,
             last_error=self.last_error,
+            hidden=frozenset(self.hidden),
+            collapsed=frozenset(self.collapsed),
+            focus=self.focus,
+            reveal_focus=reveal,
         )
 
     def close(self) -> None:
@@ -734,7 +926,11 @@ def run_tui(screen, service: RefreshService, refresh_seconds: int) -> int:
             now = datetime.now(timezone.utc)
             frame = render(controller.view(now), width, height, glyphs)
             _draw(screen, frame, width, height, attrs)
-            controller.clamp_scroll(frame.max_scroll)
+            # Adopt the offset actually rendered: the clamped scroll, plus
+            # any focus-reveal nudge. This keeps the controller's scroll in
+            # sync with the screen (spec section 7) so a single k responds
+            # immediately after an over-scroll or a focus jump.
+            controller.scroll = frame.offset
             key = screen.getch()
             controller.handle_key(key)
             controller.poll()

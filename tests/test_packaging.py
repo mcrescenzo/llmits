@@ -167,6 +167,8 @@ class ArchiveManifestTests(unittest.TestCase):
             "CLAUDE_CONFIG_DIR",
             "ZAI_API_KEY",
             "ZHIPU_API_KEY",
+            "KIMI_API_KEY",
+            "KIMI_CODE_HOME",
         ):
             env.pop(var, None)
 
@@ -183,7 +185,13 @@ class ArchiveManifestTests(unittest.TestCase):
         self.assertEqual(document["schema_version"], 1)
         statuses = {p["provider"]: p["status"] for p in document["providers"]}
         self.assertEqual(
-            statuses, {"claude": "auth_required", "codex": "auth_required", "zai": "auth_required"}
+            statuses,
+            {
+                "claude": "auth_required",
+                "codex": "auth_required",
+                "zai": "auth_required",
+                "kimi": "auth_required",
+            },
         )
 
     def test_missing_init_py_raises_system_exit(self):

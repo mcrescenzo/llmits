@@ -74,8 +74,12 @@ def view(
     ids=("claude", "codex", "zai"),
     scroll=0,
     now=NOW,
-    version="0.1.0",
+    version="0.2.0",
     last_error=None,
+    hidden=frozenset(),
+    collapsed=frozenset(),
+    focus=None,
+    reveal_focus=False,
 ):
     return tui.TuiView(
         provider_ids=ids,
@@ -87,6 +91,10 @@ def view(
         now=now,
         scroll=scroll,
         last_error=last_error,
+        hidden=hidden,
+        collapsed=collapsed,
+        focus=focus,
+        reveal_focus=reveal_focus,
     )
 
 
@@ -209,34 +217,34 @@ class RenderTests(unittest.TestCase):
 
     def test_header_first_load_no_data_shows_refreshing(self):
         header = tui._header_text(view(None, loading=True, last_refresh=None), tui.UNICODE_GLYPHS)
-        self.assertEqual(header, "llmits v0.1.0  ·  refreshing…")
+        self.assertEqual(header, "llmits v0.2.0  ·  refreshing…")
 
     def test_header_data_idle_shows_updated_and_countdown(self):
         last = NOW - timedelta(seconds=12)
         header = tui._header_text(
             view(loading=False, last_refresh=last, refresh_seconds=300), tui.UNICODE_GLYPHS
         )
-        self.assertEqual(header, "llmits v0.1.0  ·  updated 12s ago  ·  next refresh 4:48")
+        self.assertEqual(header, "llmits v0.2.0  ·  updated 12s ago  ·  next refresh 4:48")
 
     def test_header_refresh_in_flight_with_data(self):
         last = NOW - timedelta(seconds=12)
         header = tui._header_text(
             view(loading=True, last_refresh=last, refresh_seconds=300), tui.UNICODE_GLYPHS
         )
-        self.assertEqual(header, "llmits v0.1.0  ·  updated 12s ago  ·  refreshing…")
+        self.assertEqual(header, "llmits v0.2.0  ·  updated 12s ago  ·  refreshing…")
 
     def test_header_auto_refresh_disabled(self):
         last = NOW - timedelta(seconds=12)
         header = tui._header_text(
             view(loading=False, last_refresh=last, refresh_seconds=0), tui.UNICODE_GLYPHS
         )
-        self.assertEqual(header, "llmits v0.1.0  ·  updated 12s ago  ·  auto-refresh off")
+        self.assertEqual(header, "llmits v0.2.0  ·  updated 12s ago  ·  auto-refresh off")
 
     def test_header_no_data_not_loading_is_bare(self):
         header = tui._header_text(
             view(loading=False, last_refresh=None, refresh_seconds=300), tui.UNICODE_GLYPHS
         )
-        self.assertEqual(header, "llmits v0.1.0")
+        self.assertEqual(header, "llmits v0.2.0")
 
     def test_header_updated_text_present_in_full_render(self):
         # rank 27: the "updated HH:MM:SS"-successor text must actually be
@@ -247,17 +255,23 @@ class RenderTests(unittest.TestCase):
 
     def test_header_ascii_glyphs_swap_ellipsis(self):
         header = tui._header_text(view(None, loading=True), tui.ASCII_GLYPHS)
-        self.assertEqual(header, "llmits v0.1.0  -  refreshing...")
+        self.assertEqual(header, "llmits v0.2.0  -  refreshing...")
 
     # -- footer: pinned, DIM, refreshing prefix -------------------------------
 
     def test_footer_idle_text(self):
         footer = tui._footer_text(view(loading=False), tui.UNICODE_GLYPHS)
-        self.assertEqual(footer, "r refresh  ·  j/k scroll  ·  q/esc quit")
+        self.assertEqual(
+            footer,
+            "r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all",
+        )
 
     def test_footer_refreshing_prefix(self):
         footer = tui._footer_text(view(loading=True), tui.UNICODE_GLYPHS)
-        self.assertEqual(footer, "refreshing…  ·  r refresh  ·  j/k scroll  ·  q/esc quit")
+        self.assertEqual(
+            footer,
+            "refreshing…  ·  r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all",
+        )
 
     def test_footer_is_last_row_and_dim(self):
         frame = tui.render(view((snapshot(windows=(full_window(10),)),)), 120, 40)
@@ -600,7 +614,7 @@ class RenderTests(unittest.TestCase):
         class OneShotService:
             provider_ids = ("claude",)
 
-            def refresh(self):
+            def refresh(self, provider_ids=None):
                 return (snapshot(),)
 
         controller = tui.AppController(OneShotService(), 0, now_fn=lambda: NOW)
@@ -699,19 +713,32 @@ class RenderTests(unittest.TestCase):
 
 
 class FakeService:
+    """Records every requested provider-id set; gates each refresh by hand.
+
+    Mirrors RefreshService.refresh: an explicit id list returns snapshots
+    for exactly those ids, so the controller's merge logic can be tested
+    against the real subset-refresh contract.
+    """
+
     def __init__(self):
         self.calls = 0
+        self.requested = []
         self._gate = threading.Event()
 
     @property
     def provider_ids(self):
         return ("claude", "codex", "zai")
 
-    def refresh(self):
+    def _snapshot_for(self, provider_id):
+        return snapshot(provider_id, plan_name=f"Plan {provider_id} #{self.calls}")
+
+    def refresh(self, provider_ids=None):
         self.calls += 1
+        ids = tuple(self.provider_ids) if provider_ids is None else tuple(provider_ids)
+        self.requested.append(ids)
         self._gate.wait(timeout=5)
         self._gate.clear()
-        return (snapshot(), snapshot("codex"), snapshot("zai"))
+        return tuple(self._snapshot_for(pid) for pid in dict.fromkeys(ids))
 
 
 class FailingService:
@@ -725,7 +752,7 @@ class FailingService:
     def provider_ids(self):
         return ("claude", "codex", "zai")
 
-    def refresh(self):
+    def refresh(self, provider_ids=None):
         self.calls += 1
         self._gate.wait(timeout=5)
         self._gate.clear()
@@ -743,12 +770,13 @@ class FlakyService:
     def provider_ids(self):
         return ("claude", "codex", "zai")
 
-    def refresh(self):
+    def refresh(self, provider_ids=None):
         self.calls += 1
         self._gate.wait(timeout=5)
         self._gate.clear()
         if self.calls == 1:
-            return (snapshot(), snapshot("codex"), snapshot("zai"))
+            ids = tuple(self.provider_ids) if provider_ids is None else tuple(provider_ids)
+            return tuple(snapshot(pid) for pid in dict.fromkeys(ids))
         raise RuntimeError("simulated refresh failure")
 
 
@@ -925,6 +953,412 @@ class ControllerRefreshFailureTests(unittest.TestCase):
         svc._gate.set()  # let the background thread unblock and finish quietly
 
 
+class FocusToolkitRenderTests(unittest.TestCase):
+    """Session-local focus/hide/collapse toolkit: pure render behavior."""
+
+    BASE = dict(last_refresh=NOW - timedelta(seconds=12))
+
+    def test_hidden_provider_card_absent_from_every_rendered_line(self):
+        v = view(scroll_fixture(), hidden={"codex"}, **self.BASE)
+        rendered = flat(tui.render(v, 120, 40))
+        self.assertNotIn("Codex", rendered)
+        self.assertNotIn("Spark", rendered)  # a codex-only window row
+        self.assertNotIn("$42.50 balance", rendered)  # codex credits row
+        self.assertIn("Claude", rendered)
+        self.assertIn("Z.AI", rendered)
+
+    def test_hidden_provider_absent_while_fetching(self):
+        v = view(None, loading=True, hidden={"claude"})
+        rendered = flat(tui.render(v, 80, 24))
+        self.assertNotIn("Claude", rendered)
+        self.assertIn("Codex", rendered)
+
+    def test_label_width_recomputed_without_the_hidden_card(self):
+        # scroll_fixture's longest label lives on codex's rows ("credits"/
+        # "banked", 7 chars); hiding codex must shrink the shared label
+        # column from 7 to claude's longest ("Sonnet", 6).
+        base = view(scroll_fixture(), **self.BASE)
+        without_codex = replace(base, hidden=frozenset({"codex"}))
+
+        def five_hour_label_segment(v):
+            frame = tui.render(v, 120, 40)
+            line = next(
+                line for line in frame.lines if "".join(s.text for s in line).startswith("  5h")
+            )
+            return line[0].text
+
+        self.assertEqual(len(five_hour_label_segment(base)), 2 + 7 + 1)
+        self.assertEqual(len(five_hour_label_segment(without_codex)), 2 + 6 + 1)
+
+    def test_all_hidden_renders_only_the_restore_hint(self):
+        everything = frozenset({"claude", "codex", "zai"})
+        for width, height in ((60, 15), (80, 24)):
+            with self.subTest(size=(width, height)):
+                v = view(scroll_fixture(), hidden=everything, **self.BASE)
+                frame = tui.render(v, width, height)
+                rendered = flat(frame)
+                self.assertIn("all providers hidden · press a to restore", rendered)
+                for name in ("Claude", "Codex", "Z.AI"):
+                    self.assertNotIn(name, rendered)
+                self.assertIn("q/esc quit", rendered)  # footer still pinned
+                self.assertEqual(frame.max_scroll, 0)
+
+    def test_all_hidden_hint_is_ascii_under_ascii_glyphs(self):
+        v = view(None, hidden=frozenset({"claude", "codex", "zai"}))
+        frame = tui.render(v, 60, 15, tui.ASCII_GLYPHS)
+        rendered = flat(frame)
+        self.assertIn("all providers hidden - press a to restore", rendered)
+        for line in text(frame.lines):
+            self.assertTrue(line.isascii(), line)
+
+    def test_focus_marker_prefixes_exactly_one_card_header(self):
+        v = view(
+            four_card_fixture()[:3],
+            ids=("claude", "codex", "zai"),
+            focus="codex",
+            **self.BASE,
+        )
+        frame = tui.render(v, 120, 40)
+        marked = [line for line in text(frame.lines) if line.startswith("> ")]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("Codex", marked[0])
+
+    def test_focus_marker_is_ascii_and_clipped_at_compact_width(self):
+        # 60x15 shows only the first cards; focus claude so the marker is
+        # inside the initial viewport without needing a reveal.
+        v = view(scroll_fixture(), focus="claude", **self.BASE)
+        frame = tui.render(v, 60, 15, tui.ASCII_GLYPHS)
+        marked = [line for line in text(frame.lines) if line.startswith("> ")]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("Claude", marked[0])
+        for line in text(frame.lines):
+            self.assertTrue(line.isascii(), line)
+            self.assertLessEqual(len(line), 59)
+
+    def test_focus_marker_on_fetching_placeholder(self):
+        v = view(None, loading=True, focus="zai")
+        rendered = flat(tui.render(v, 80, 24))
+        marked = [line for line in rendered.splitlines() if line.startswith("> ")]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("Z.AI", marked[0])
+        self.assertIn("fetching", marked[0])
+
+    def test_no_focus_marker_without_focus(self):
+        frame = tui.render(view(scroll_fixture(), **self.BASE), 120, 40)
+        for line in text(frame.lines):
+            self.assertFalse(line.startswith("> "), line)
+
+    def test_collapsed_card_keeps_header_drops_window_rows(self):
+        v = view(scroll_fixture(), collapsed={"claude"}, **self.BASE)
+        rendered = flat(tui.render(v, 120, 40))
+        self.assertIn("Claude", rendered)
+        for claude_only in ("Opus", "Sonnet", "Fable"):
+            self.assertNotIn(claude_only, rendered)
+        self.assertIn("Codex", rendered)
+        self.assertIn("Z.AI", rendered)
+
+    def test_collapse_shrinks_max_scroll(self):
+        base = view(scroll_fixture(), **self.BASE)
+        collapsed = replace(base, collapsed=frozenset({"claude"}))
+        open_frame = tui.render(base, 60, 15)
+        shut_frame = tui.render(collapsed, 60, 15)
+        self.assertGreater(open_frame.max_scroll, 0)
+        # claude contributes 1 header + 6 window rows; collapsing removes 6.
+        self.assertEqual(open_frame.max_scroll - shut_frame.max_scroll, 6)
+
+    def test_footer_lists_focus_toolkit_keys(self):
+        footer = tui._footer_text(view(), tui.UNICODE_GLYPHS)
+        for hint in (
+            "r/R refresh",
+            "tab focus",
+            "h hide",
+            "c collapse",
+            "a show all",
+            "q/esc quit",
+        ):
+            self.assertIn(hint, footer)
+
+    def test_footer_keeps_quit_visible_at_minimum_width(self):
+        frame = tui.render(view(scroll_fixture(), **self.BASE), 60, 15)
+        footer = "".join(s.text for s in frame.lines[-1])
+        self.assertIn("q/esc quit", footer)
+
+    def test_reveal_focus_pulls_focused_header_into_view(self):
+        base = view(scroll_fixture(), focus="zai", scroll=0, **self.BASE)
+        without_reveal = tui.render(replace(base, reveal_focus=False), 60, 15)
+        self.assertNotIn("Z.AI", flat(without_reveal))
+        revealed = tui.render(replace(base, reveal_focus=True), 60, 15)
+        self.assertIn("Z.AI", flat(revealed))
+        self.assertGreater(revealed.offset, 0)
+        self.assertLessEqual(revealed.offset, revealed.max_scroll)
+
+    def test_reveal_focus_pulls_back_when_focused_card_is_above_the_viewport(self):
+        base = view(scroll_fixture(), focus="claude", scroll=500, **self.BASE)
+        without_reveal = tui.render(replace(base, reveal_focus=False), 60, 15)
+        self.assertNotIn("Claude", flat(without_reveal))
+        revealed = tui.render(replace(base, reveal_focus=True), 60, 15)
+        self.assertIn("Claude", flat(revealed))
+        self.assertEqual(revealed.offset, 0)
+
+    def test_hidden_collapsed_and_focused_still_respect_width_limits(self):
+        v = view(
+            scroll_fixture(),
+            hidden={"codex"},
+            collapsed={"zai"},
+            focus="zai",
+            **self.BASE,
+        )
+        for width, height in ((60, 15), (80, 24), (120, 40)):
+            with self.subTest(size=(width, height)):
+                frame = tui.render(v, width, height)
+                for line in text(frame.lines):
+                    self.assertLessEqual(len(line), width - 1)
+
+
+class FocusToolkitControllerTests(unittest.TestCase):
+    """tab/h/a/c/R keys and the subset-refresh merge, through AppController."""
+
+    @staticmethod
+    def settle(controller, timeout=5):
+        future = controller._future
+        if future is not None:
+            future.result(timeout=timeout)
+
+    def _settled_controller(self, refresh_seconds=0):
+        svc = FakeService()
+        controller = tui.AppController(svc, refresh_seconds, now_fn=lambda: NOW)
+        controller.start()
+        svc._gate.set()
+        self.settle(controller)
+        controller.poll(NOW)
+        return controller, svc
+
+    def test_tab_cycles_forward_and_wraps(self):
+        controller, _ = self._settled_controller()
+        try:
+            self.assertEqual(controller.focus, "claude")
+            for expected in ("codex", "zai", "claude", "codex"):
+                controller.handle_key(ord("\t"))
+                self.assertEqual(controller.focus, expected)
+        finally:
+            controller.close()
+
+    def test_shift_tab_cycles_backward_and_wraps(self):
+        controller, _ = self._settled_controller()
+        try:
+            for expected in ("zai", "codex", "claude", "zai"):
+                controller.handle_key(curses.KEY_BTAB)
+                self.assertEqual(controller.focus, expected)
+        finally:
+            controller.close()
+
+    def test_tab_with_single_visible_provider_holds_focus(self):
+        controller, _ = self._settled_controller()
+        try:
+            controller.handle_key(ord("h"))  # hide claude -> codex
+            controller.handle_key(ord("h"))  # hide codex -> zai
+            self.assertEqual(controller.visible_ids, ("zai",))
+            for _ in range(3):
+                controller.handle_key(ord("\t"))
+                self.assertEqual(controller.focus, "zai")
+        finally:
+            controller.close()
+
+    def test_h_hides_focused_and_moves_focus_to_next_visible(self):
+        controller, _ = self._settled_controller()
+        try:
+            controller.handle_key(ord("h"))
+            self.assertEqual(controller.hidden, {"claude"})
+            self.assertEqual(controller.focus, "codex")
+            rendered = flat(tui.render(controller.view(NOW), 80, 24))
+            self.assertNotIn("Claude", rendered)
+            self.assertIn("Codex", rendered)
+        finally:
+            controller.close()
+
+    def test_a_restores_hidden_and_collapsed_and_refreshes_every_provider(self):
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("h"))  # hide claude; focus moves to codex
+            controller.handle_key(ord("c"))  # collapse codex
+            calls_before = svc.calls
+            controller.handle_key(ord("a"))
+            self.assertEqual(controller.hidden, set())
+            self.assertEqual(controller.collapsed, set())
+            self.assertEqual(svc.calls, calls_before + 1)
+            self.assertEqual(svc.requested[-1], ("claude", "codex", "zai"))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+        finally:
+            controller.close()
+
+    def test_r_refreshes_visible_ids_only(self):
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("h"))  # hide claude
+            calls = svc.calls
+            controller.handle_key(ord("r"))
+            self.assertEqual(svc.calls, calls + 1)
+            self.assertEqual(svc.requested[-1], ("codex", "zai"))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+        finally:
+            controller.close()
+
+    def test_capital_R_refreshes_only_the_focused_provider(self):
+        controller, svc = self._settled_controller()
+        try:
+            before = {s.provider: s for s in controller.snapshots}
+            controller.handle_key(ord("\t"))  # codex
+            controller.handle_key(ord("R"))
+            self.assertEqual(svc.requested[-1], ("codex",))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+            after = {s.provider: s for s in controller.snapshots}
+            self.assertEqual(set(after), {"claude", "codex", "zai"})  # merge keeps all three
+            self.assertIsNot(after["codex"], before["codex"])  # focused replaced
+            self.assertIs(after["claude"], before["claude"])  # others untouched
+            self.assertIs(after["zai"], before["zai"])
+            self.assertEqual(
+                [s.provider for s in controller.snapshots], ["claude", "codex", "zai"]
+            )
+        finally:
+            controller.close()
+
+    def test_focused_refresh_while_pending_keeps_pending_id_set(self):
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("r"))  # full visible refresh, pending
+            calls = svc.calls
+            controller.handle_key(ord("\t"))
+            controller.handle_key(ord("\t"))
+            controller.handle_key(ord("R"))  # suppressed while in flight
+            self.assertEqual(svc.calls, calls)
+            self.assertEqual(svc.requested[-1], ("claude", "codex", "zai"))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+        finally:
+            controller.close()
+
+    def test_focus_survives_hiding_and_restoring_across_reordering(self):
+        controller, _ = self._settled_controller()
+        try:
+            controller.handle_key(ord("\t"))
+            self.assertEqual(controller.focus, "codex")
+            controller.handle_key(ord("h"))  # hide codex; focus moves to zai
+            self.assertEqual(controller.focus, "zai")
+            controller.handle_key(ord("a"))  # restore all; focus must stay zai
+            self.assertEqual(controller.focus, "zai")
+            marked = [
+                line
+                for line in text(tui.render(controller.view(NOW), 120, 40).lines)
+                if line.startswith("> ")
+            ]
+            self.assertEqual(len(marked), 1)
+            self.assertIn("Z.AI", marked[0])
+        finally:
+            controller.close()
+
+    def test_a_during_inflight_refresh_defers_the_full_refresh(self):
+        # The restore contract ("a restores all AND refreshes them") must
+        # survive an in-flight subset refresh: `a` while `R` is pending
+        # defers the full refresh instead of silently dropping it.
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("\t"))  # codex
+            controller.handle_key(ord("R"))  # focused refresh, pending
+            controller.handle_key(ord("h"))  # hide codex
+            controller.handle_key(ord("a"))  # restore all while R is in flight
+            self.assertEqual(controller.hidden, set())
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)  # adopts the focused refresh, submits the deferred one
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+            # start(all) -> R(codex) -> deferred restore(all): exactly three refreshes.
+            self.assertEqual(len(svc.requested), 3)
+            self.assertEqual(svc.calls, 3)
+            self.assertEqual(svc.requested[-2:], [("codex",), ("claude", "codex", "zai")])
+            self.assertEqual(
+                [s.provider for s in controller.snapshots], ["claude", "codex", "zai"]
+            )
+        finally:
+            controller.close()
+
+    def test_a_during_inflight_refresh_defers_even_when_that_refresh_fails(self):
+        class FlakyFocusedService(FakeService):
+            def refresh(self, provider_ids=None):
+                snapshots = super().refresh(provider_ids)
+                if provider_ids == ("codex",):
+                    raise RuntimeError("simulated focused-refresh failure")
+                return snapshots
+
+        svc = FlakyFocusedService()
+        controller = tui.AppController(svc, 0, now_fn=lambda: NOW)
+        controller.start()
+        svc._gate.set()
+        ControllerTests.settle(controller)
+        controller.poll(NOW)
+        try:
+            controller.handle_key(ord("\t"))  # codex
+            controller.handle_key(ord("R"))  # will fail once released
+            controller.handle_key(ord("a"))  # deferred behind the failing refresh
+            svc._gate.set()
+            ControllerRefreshFailureTests.settle_ignoring_failure(controller)
+            controller.poll(NOW)
+            self.assertIsNotNone(controller.last_error)  # failure surfaced
+            svc._gate.set()
+            ControllerTests.settle(controller)
+            controller.poll(NOW)
+            self.assertEqual(svc.requested[-1], ("claude", "codex", "zai"))
+            self.assertIsNone(controller.last_error)
+        finally:
+            controller.close()
+
+    def test_c_toggles_collapse_of_the_focused_card(self):
+        controller, _ = self._settled_controller()
+        try:
+            controller.handle_key(ord("c"))
+            self.assertEqual(controller.view(NOW).collapsed, frozenset({"claude"}))
+            self.assertEqual(controller.view(NOW).focus, "claude")
+            controller.handle_key(ord("c"))
+            self.assertEqual(controller.view(NOW).collapsed, frozenset())
+        finally:
+            controller.close()
+
+    def test_r_with_all_providers_hidden_refreshes_nothing(self):
+        controller, svc = self._settled_controller()
+        try:
+            for _ in range(3):
+                controller.handle_key(ord("h"))  # hide claude, codex, zai
+            self.assertEqual(controller.visible_ids, ())
+            calls = svc.calls
+            controller.handle_key(ord("r"))
+            self.assertEqual(svc.calls, calls)
+            self.assertFalse(controller.loading)
+            rendered = flat(tui.render(controller.view(NOW), 60, 15))
+            self.assertIn("all providers hidden", rendered)
+            controller.handle_key(ord("a"))
+            self.assertEqual(controller.visible_ids, ("claude", "codex", "zai"))
+            self.assertEqual(controller.focus, "claude")
+        finally:
+            controller.close()
+
+    def test_view_reveal_flag_is_one_shot(self):
+        controller, _ = self._settled_controller()
+        try:
+            controller.handle_key(ord("\t"))
+            self.assertTrue(controller.view(NOW).reveal_focus)
+            self.assertFalse(controller.view(NOW).reveal_focus)
+        finally:
+            controller.close()
+
+
 class ShutdownSubprocessTests(unittest.TestCase):
     """Process-level proof that close() does not delay interpreter exit.
 
@@ -944,7 +1378,7 @@ from llmits import tui
 class SlowService:
     provider_ids = ("claude",)
 
-    def refresh(self):
+    def refresh(self, provider_ids=None):
         time.sleep(2)
         return ()
 
@@ -1036,25 +1470,29 @@ class ScrollTests(unittest.TestCase):
         controller.close()
 
     def test_scroll_clamps_to_content_after_over_scroll(self):
-        # Spec section 7: today the offset can run to _scroll_cap (512)
-        # while the viewport silently clamps at render time, so the user
-        # has to press k dozens of times before anything visibly moves.
-        # clamp_scroll pulls the controller's own state back down so a
-        # single k responds immediately.
+        # Spec section 7: the offset can run to _scroll_cap (512) while the
+        # viewport silently clamps at render time, so the user would have
+        # to press k dozens of times before anything visibly moves. run_tui
+        # adopts Frame.offset after every draw, which pulls the
+        # controller's own state back down so a single k responds
+        # immediately.
         controller = tui.AppController(FakeService(), 0)
         for _ in range(50):
             controller.handle_key(ord("j"))
         self.assertEqual(controller.scroll, 50)
-        controller.clamp_scroll(5)
-        self.assertEqual(controller.scroll, 5)
+        frame = tui.render(
+            _replace_scroll(
+                view(scroll_fixture(), last_refresh=NOW - timedelta(seconds=12)), 50
+            ),
+            60,
+            15,
+        )
+        self.assertGreater(frame.max_scroll, 0)
+        controller.scroll = frame.offset  # what run_tui does each frame
+        self.assertLessEqual(controller.scroll, frame.max_scroll)
+        self.assertGreaterEqual(controller.scroll, 0)
         controller.handle_key(ord("k"))
-        self.assertEqual(controller.scroll, 4)
-        controller.close()
-
-    def test_clamp_scroll_never_goes_negative(self):
-        controller = tui.AppController(FakeService(), 0)
-        controller.clamp_scroll(0)
-        self.assertEqual(controller.scroll, 0)
+        self.assertEqual(controller.scroll, frame.offset - 1)
         controller.close()
 
     def test_visible_lines_never_exceed_width_at_any_offset(self):
@@ -1171,7 +1609,7 @@ class InstantService:
 
     provider_ids = ("claude",)
 
-    def refresh(self):
+    def refresh(self, provider_ids=None):
         return (snapshot(),)
 
 

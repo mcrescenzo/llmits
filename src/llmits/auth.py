@@ -323,19 +323,100 @@ def read_codex_token(cli_path: str | None = None) -> str:
     )
 
 
-def _pi_zai_key(data: dict) -> str | None:
-    entry = data.get("zai")
-    if not isinstance(entry, dict) or entry.get("type") != "api_key":
+def _pi_literal_api_key(entry_name: str):
+    """Extractor for one Pi ``auth.json`` entry carrying a literal api key.
+
+    Pi supports shell commands (``!cmd``) and environment interpolation
+    (``$VAR``) in the ``key`` field; llmits never executes commands and
+    must not treat an unresolved reference as a credential.
+    """
+
+    def extract(data: dict) -> str | None:
+        entry = data.get(entry_name)
+        if not isinstance(entry, dict) or entry.get("type") != "api_key":
+            return None
+        key = entry.get("key")
+        if not isinstance(key, str):
+            return None
+        if key.startswith(("!", "$")):
+            return None
+        return key
+
+    return extract
+
+
+_pi_zai_key = _pi_literal_api_key("zai")
+
+
+_KIMI_CODE_BASE_URLS = frozenset(
+    {"https://api.kimi.com/coding/v1", "https://api.kimi.com/coding/v1/"}
+)
+
+
+def _kimi_code_config_path() -> Path:
+    configured = os.environ.get("KIMI_CODE_HOME")
+    if configured:
+        return Path(configured).expanduser() / "config.toml"
+    return Path.home() / ".kimi-code" / "config.toml"
+
+
+def _kimi_key_from_cli_config(data: dict) -> str | None:
+    """A ``[providers.<name>]`` ``api_key`` bound to the Kimi Code base URL.
+
+    Mirrors the Z.AI binding rule: only an entry whose ``base_url`` is the
+    exact documented Kimi Code endpoint (byte-for-byte, one optional
+    trailing slash) can contribute a key. An entry pointed at
+    ``api.moonshot.ai`` (pay-as-you-go Moonshot) or any other base is
+    skipped, and so is an entry without a ``base_url``: the default
+    platform for such an entry is not evidenced, and llmits does not guess
+    audiences.
+    """
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
         return None
-    key = entry.get("key")
-    if not isinstance(key, str):
-        return None
-    # Pi supports shell commands and environment interpolation in this field.
-    # llmits never executes commands and must not treat an unresolved reference
-    # as a credential. Environment variables are handled by earlier sources.
-    if key.startswith(("!", "$")):
-        return None
-    return key
+    for entry in providers.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("base_url") not in _KIMI_CODE_BASE_URLS:
+            continue
+        key = entry.get("api_key")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return None
+
+
+def _kimi_sources() -> tuple[CredentialSource, ...]:
+    return (
+        StructuredFileSource(
+            audience="kimi",
+            path=lambda: Path.home() / ".pi" / "agent" / "auth.json",
+            what="Pi auth file",
+            loader=secure_read_json,
+            extract=_pi_literal_api_key("kimi-coding"),
+            optional=True,
+        ),
+        StructuredFileSource(
+            audience="kimi",
+            path=_kimi_code_config_path,
+            what="Kimi CLI config file",
+            loader=secure_read_toml,
+            extract=_kimi_key_from_cli_config,
+            optional=True,
+        ),
+    )
+
+
+def read_kimi_key() -> str:
+    return discover_credential(
+        CredentialSpec(
+            provider="kimi",
+            sources=_kimi_sources(),
+            missing_message="Kimi Coding Plan key not set or discoverable",
+            missing_action=(
+                "configure kimi-cli or Pi with a provider-bound Kimi Coding Plan key"
+            ),
+        )
+    )
 
 
 _ZAI_CLAUDE_BASE_URLS = frozenset(
@@ -427,6 +508,7 @@ _PROVIDER_CREDENTIAL_READERS: dict[str, Callable[[str | None], str]] = {
     "claude": read_claude_token,
     "codex": read_codex_token,
     "zai": lambda _explicit_path: read_zai_key(),
+    "kimi": lambda _explicit_path: read_kimi_key(),
 }
 
 
