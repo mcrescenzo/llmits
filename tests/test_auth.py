@@ -24,6 +24,8 @@ ISOLATED_ENV_VARS = (
     "ZHIPU_API_KEY",
     "KIMI_API_KEY",
     "KIMI_CODE_HOME",
+    "XDG_DATA_HOME",
+    "OPENCODE_AUTH_CONTENT",
     "FIRST_TEST_KEY",
     "SECOND_TEST_KEY",
 )
@@ -563,6 +565,104 @@ class ZaiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
             auth.read_zai_key()
         self.assertIn("Z.AI API key not set", ctx.exception.error.message)
         self.assertIn("ZAI_API_KEY", ctx.exception.error.action)
+
+
+class OpenCodeCredentialTests(IsolatedHomeMixin, unittest.TestCase):
+    def test_discovers_only_exact_opencode_go_api_entry(self):
+        make_creds(
+            self.tmp,
+            ".local/share/opencode/auth.json",
+            {
+                "opencode": {"type": "api", "key": DECOY},
+                "opencode-zen": {"type": "api", "key": DECOY},
+                "opencode-go": {"type": "api", "key": SENTINEL},
+            },
+        )
+
+        self.assertEqual(auth.read_opencode_go_key(), SENTINEL)
+
+    def test_xdg_data_home_selects_the_exact_auth_file(self):
+        custom = self.tmp / "custom-data"
+        custom.mkdir()
+        os.environ["XDG_DATA_HOME"] = str(custom)
+        make_creds(
+            self.tmp,
+            ".local/share/opencode/auth.json",
+            {"opencode-go": {"type": "api", "key": DECOY}},
+        )
+        make_creds(
+            custom,
+            "opencode/auth.json",
+            {"opencode-go": {"type": "api", "key": SENTINEL}},
+        )
+        self.assertEqual(auth.read_opencode_go_key(), SENTINEL)
+
+    def test_relative_xdg_data_home_falls_back_to_fixed_home_location(self):
+        original_cwd = Path.cwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, original_cwd)
+        os.environ["XDG_DATA_HOME"] = "relative-data"
+        make_creds(
+            self.tmp,
+            "relative-data/opencode/auth.json",
+            {"opencode-go": {"type": "api", "key": DECOY}},
+        )
+        make_creds(
+            self.tmp,
+            ".local/share/opencode/auth.json",
+            {"opencode-go": {"type": "api", "key": SENTINEL}},
+        )
+
+        self.assertEqual(auth.read_opencode_go_key(), SENTINEL)
+
+    def test_ignores_zen_oauth_wellknown_and_unbound_entries(self):
+        payloads = (
+            {"opencode": {"type": "api", "key": DECOY}},
+            {"opencode-zen": {"type": "api", "key": DECOY}},
+            {"other": {"type": "api", "key": DECOY}},
+            {"opencode-go": {"type": "oauth", "access": DECOY}},
+            {"opencode-go": {"type": "wellknown", "key": DECOY, "token": DECOY}},
+            {"opencode-go": {"type": "api", "key": "  "}},
+            {"opencode-go": {"key": DECOY}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                make_creds(self.tmp, ".local/share/opencode/auth.json", payload)
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.read_opencode_go_key()
+                text = ctx.exception.error.message + ctx.exception.error.action
+                self.assertNotIn(DECOY, text)
+                self.assertNotIn(str(self.tmp), text)
+
+    def test_ignores_environment_auth_content(self):
+        os.environ["OPENCODE_AUTH_CONTENT"] = json.dumps(
+            {"opencode-go": {"type": "api", "key": DECOY}}
+        )
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_opencode_go_key()
+        text = ctx.exception.error.message + ctx.exception.error.action
+        self.assertIn("OpenCode Go key not set", ctx.exception.error.message)
+        self.assertNotIn(DECOY, text)
+        self.assertNotIn(str(self.tmp), text)
+
+    def test_existing_unsafe_or_malformed_provider_file_fails_closed(self):
+        for contents, mode, expected in (
+            ("not json", 0o600, "not valid JSON"),
+            (json.dumps({"opencode-go": {"type": "api", "key": DECOY}}), 0o644, "readable by group"),
+        ):
+            with self.subTest(expected=expected):
+                write_file(
+                    self.tmp,
+                    ".local/share/opencode/auth.json",
+                    contents,
+                    mode=mode,
+                )
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.read_opencode_go_key()
+                text = ctx.exception.error.message + ctx.exception.error.action
+                self.assertIn(expected, ctx.exception.error.message)
+                self.assertNotIn(DECOY, text)
+                self.assertNotIn(str(self.tmp), text)
 
 
 class KimiCredentialTests(IsolatedHomeMixin, unittest.TestCase):

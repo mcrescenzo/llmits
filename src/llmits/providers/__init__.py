@@ -1,20 +1,22 @@
 """Provider registry: fixed identifiers, display names, and fetch entry points."""
 from __future__ import annotations
 
-from . import claude, codex, kimi, zai
+from . import claude, codex, kimi, opencode, zai
 
-PROVIDER_IDS = ("claude", "codex", "zai", "kimi")
+PROVIDER_IDS = ("claude", "codex", "zai", "kimi", "opencode")
 DISPLAY_NAMES = {
     "claude": "Claude",
     "codex": "Codex",
     "zai": "Z.AI",
     "kimi": "Kimi",
+    "opencode": "OpenCode",
 }
 FETCHERS = {
     "claude": claude.fetch,
     "codex": codex.fetch,
     "zai": zai.fetch,
     "kimi": kimi.fetch,
+    "opencode": opencode.fetch,
 }
 
 

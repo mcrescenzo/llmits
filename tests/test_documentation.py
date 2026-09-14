@@ -53,6 +53,44 @@ class PublicDocumentationTests(unittest.TestCase):
         ):
             self.assertIn(contract, self.readme)
 
+    def test_readme_documents_opencode_go_without_claiming_zen_balance(self) -> None:
+        for contract in (
+            "**OpenCode Go**",
+            "`$XDG_DATA_HOME/opencode/auth.json`",
+            "`opencode-go`",
+            "`percent` is the **used** share",
+            "Zen prepaid balance remains unsupported",
+            "`9f8db119fcbd4999379129ac7734375ac23460fb`",
+        ):
+            self.assertIn(contract, self.readme)
+
+    def test_security_policy_covers_opencode_boundaries(self) -> None:
+        for contract in (
+            "`opencode.ai`",
+            "`GET /zen/go/v1/usage`",
+            "`opencode-go`",
+            "Zen and OAuth entries are ignored",
+        ):
+            self.assertIn(contract, self.security)
+
+    def test_readme_documents_the_overview_contract(self) -> None:
+        for contract in (
+            "`--overview`",
+            "`--order {configured,urgency}`",
+            "`N%~`",
+            "`--overview` never exits `3`",
+            "stable ties",
+        ):
+            self.assertIn(contract, self.readme)
+
+    def test_security_policy_covers_the_overview_output_surface(self) -> None:
+        for contract in (
+            "`--overview` renders the same normalized snapshots",
+            "re-clamped through `bounded_percent`",
+            "`--overview` output",
+        ):
+            self.assertIn(contract, self.security)
+
     def test_security_policy_describes_remediated_boundaries(self) -> None:
         for contract in (
             "SSLKEYLOGFILE",

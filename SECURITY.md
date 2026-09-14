@@ -9,7 +9,7 @@ Security fixes are made against the latest released `llmits` version on supporte
 ## Threat model
 
 - The tool runs on a single-user Linux machine and reads files owned by that user.
-- Assets at risk: Claude/Codex OAuth tokens, the Z.AI and Kimi API keys, and the contents of provider usage responses (which may include account metadata).
+- Assets at risk: Claude/Codex OAuth tokens, the Z.AI, Kimi, and OpenCode Go API keys, and the contents of provider usage responses (which may include account metadata).
 - Adversaries considered: other local users reading files or environment leakage, hostile or poisoned environments (injected env vars, symlinks, hostile `PATH`), and malicious/compromised provider endpoints or intermediaries.
 
 ## Non-goals
@@ -17,7 +17,7 @@ Security fixes are made against the latest released `llmits` version on supporte
 - No credential issuance, refresh, rotation, command-based credential helper execution, or environment-expression evaluation. Official tools own login.
 - No application persistence during normal zipapp use: no cache, config, history, credential, or log files are created. Python may create `__pycache__` directories when the package is run from a source checkout, and maintainer commands intentionally write build artifacts such as `dist/llmits`; neither contains credentials or provider responses.
 - No broad credential search: no directory scans, shell-startup parsing, keychain access, or undocumented store formats.
-- No outbound surface beyond the four fixed usage endpoints.
+- No outbound surface beyond the five fixed usage endpoints.
 
 ## Credential handling
 
@@ -30,6 +30,7 @@ Security fixes are made against the latest released `llmits` version on supporte
 - Optional cross-tool sources are skipped when absent, insecure, malformed, or not bound to the expected provider. Strict provider-owned credential files remain fail-closed.
 - Z.AI keys in Claude or Codex configuration are accepted only beside the exact documented global Z.AI base URL. China-plan and arbitrary proxy URLs are not retargeted to `api.z.ai`.
 - Kimi keys in kimi-cli configuration are accepted only from a `[providers.<name>]` entry whose `base_url` is the exact Kimi Code endpoint; pay-as-you-go Moonshot entries and entries without a base URL are skipped. The audience-ambiguous `KIMI_API_KEY` environment variable is ignored. Kimi OAuth credential files are never read.
+- OpenCode Go discovery reads only an absolute `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`; relative values fall back to that default) and accepts only the exact `opencode-go` entry with `type: "api"` and a non-empty string key. Zen and OAuth entries are ignored, as are well-known and unrelated entries; `OPENCODE_AUTH_CONTENT` is not read or interpreted.
 - Pi `auth.json` discovery accepts only literal `api_key` values for the provider's own entry (`zai`, `kimi-coding`). Shell-command and environment-expression values are ignored rather than executed or interpreted.
 - Errors never contain tokens, authorization headers, provider-supplied configuration values, or credential paths.
 
@@ -41,12 +42,14 @@ Security fixes are made against the latest released `llmits` version on supporte
 | Codex | `chatgpt.com` | `GET /backend-api/wham/usage` |
 | Z.AI | `api.z.ai` | `GET /api/monitor/usage/quota/limit` |
 | Kimi | `api.kimi.com` | `GET /coding/v1/usages` |
+| OpenCode Go | `opencode.ai` | `GET /zen/go/v1/usage` |
 
 - Hosts and paths are compile-time constants inside provider adapters. CLI options and environment variables cannot influence a destination.
 - TLS contexts are built by an explicit factory (`create_tls_context` in `src/llmits/http.py`), not `ssl.create_default_context()`: hostname checks and certificate verification are always required, and the trust store comes only from the interpreter's compiled-in CA locations. Ambient `SSLKEYLOGFILE` is never honored (no key-log file is created or written), and ambient `SSL_CERT_FILE`/`SSL_CERT_DIR` cannot redirect the trust store; if the compiled-in locations are missing, verification fails closed rather than falling back to environment-controlled paths. No proxy environment variables are honored; redirects are never followed (a redirect is reported as a provider error).
 - Requests time out after 10 seconds; response bodies are capped at 1 MiB.
 - `User-Agent` is exactly `llmits/<version>`.
 - Z.AI retries once with a `Bearer` header against the same fixed host/path only after a 401/403, mirroring the official Z.AI plugin's authentication variant.
+- OpenCode Go sends its exact provider-bound key as a Bearer credential. A 403 response is the documented missing-Go-entitlement result and is normalized to `unavailable`, never inferred from the response body.
 
 ## Output hygiene
 
@@ -54,14 +57,16 @@ Security fixes are made against the latest released `llmits` version on supporte
 - JSON output is structurally limited to normalized fields. Error text is sanitized (control characters stripped, length capped) and never includes response bodies or tokens. Provider error text is fixed local wording; provider `msg` fields are never echoed. Transport exception text is never surfaced either: network failures keep a stable `network_error` classification with a fixed local message and only the exception class name.
 - Upstream limit identifiers are treated as untrusted at the adapter boundary: recognized ones map to a fixed local vocabulary (e.g. `spk` -> "Spark"), and anything unrecognized gets a collision-safe ordinal id (`x1` -> "Limit 1") that contains no provider-derived characters, so raw provider strings never reach keys, labels, JSON, or the TUI.
 - Provider-derived plan/level strings are vetted against a strict shape before use and sanitized and length-capped again at the model boundary, so terminal escape sequences (including C1/OSC) cannot reach JSON or the TUI.
+- The OpenCode Go parser accepts only the complete first-party `usage.{rolling,weekly,monthly}.{status,percent,resetsAt}` shape, exact fixed field names, status values, integer percentages from 0 through 100, and UTC timestamps. Unknown or missing fields fail closed as `parse_error`; no provider-derived identifiers are rendered.
 - The TUI renders only normalized snapshots.
+- `--overview` renders the same normalized snapshots as a single newline-terminated ASCII line of `provider=state` tokens separated by single ASCII spaces. Its only rendered values are the fixed provider ids, the normalized status vocabulary, and window percentages re-clamped through `bounded_percent` to an integer 0-100; plan names, window keys and labels, error text, timestamps, and any other provider-derived string never appear in `--overview` output.
 - `--diagnose` resolves credentials through the production readers and checks only the same compile-time fixed provider endpoints used by normal refreshes; providers without a discovered credential are not contacted. Its output contains only app/Python/platform versions and fixed local credential, endpoint, and payload-compatibility classifications—never credential values, credential paths, source names, provider payloads, or exception text.
 
 ## Guarantees enforced by tests
 
 - `tests/test_security.py` statically rejects forbidden imports (`subprocess`, `urllib`, `webbrowser`, `ctypes`, `shutil`, …) and forbidden calls (`eval`, `exec`, `os.system`, …) in `src/`.
 - The same test rejects application file-writing APIs in `src/` (write-mode `open`, `os.remove`, `Path.write_text`, …) and restricts `os.open` flags to the read-only credential open.
-- Sentinel tests assert that credentials, provider-derived limit names, and transport exception text never appear in snapshots, JSON, TUI output, or `--diagnose` output.
+- Sentinel tests assert that credentials, provider-derived limit names, and transport exception text never appear in snapshots, JSON, TUI output, `--diagnose` output, or `--overview` output.
 - `tests/test_provider_conformance.py` re-checks the shared adapter contract (registry wiring, normalized success, fail-closed parse errors, transport/auth classification, compile-time host and path pins) for every registered provider, so adding a provider without extending the suite fails.
 - TLS tests prove ambient key-log and trust-store variables are ignored while certificate and hostname verification remain required.
 - Packaging tests build twice, compare bytes, inspect normalized archive metadata, verify the complete MIT notice, and exercise the artifact without credentials.

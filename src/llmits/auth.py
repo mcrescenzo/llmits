@@ -348,6 +348,47 @@ def _pi_literal_api_key(entry_name: str):
 _pi_zai_key = _pi_literal_api_key("zai")
 
 
+def _opencode_auth_path() -> Path:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if data_home:
+        candidate = Path(data_home)
+        if candidate.is_absolute():
+            return candidate / "opencode" / "auth.json"
+    return Path.home() / ".local" / "share" / "opencode" / "auth.json"
+
+
+def _opencode_go_key(data: dict) -> str | None:
+    entry = data.get("opencode-go")
+    if not isinstance(entry, dict) or entry.get("type") != "api":
+        return None
+    key = entry.get("key")
+    return key if isinstance(key, str) else None
+
+
+def _opencode_sources() -> tuple[CredentialSource, ...]:
+    return (
+        StructuredFileSource(
+            audience="opencode",
+            path=_opencode_auth_path,
+            what="OpenCode auth file",
+            loader=secure_read_json,
+            extract=_opencode_go_key,
+            missing_action="log in to OpenCode Go again",
+        ),
+    )
+
+
+def read_opencode_go_key() -> str:
+    return discover_credential(
+        CredentialSpec(
+            provider="opencode",
+            sources=_opencode_sources(),
+            missing_message="OpenCode Go key not set or discoverable",
+            missing_action="log in to OpenCode Go again",
+        )
+    )
+
+
 _KIMI_CODE_BASE_URLS = frozenset(
     {"https://api.kimi.com/coding/v1", "https://api.kimi.com/coding/v1/"}
 )
@@ -509,6 +550,7 @@ _PROVIDER_CREDENTIAL_READERS: dict[str, Callable[[str | None], str]] = {
     "codex": read_codex_token,
     "zai": lambda _explicit_path: read_zai_key(),
     "kimi": lambda _explicit_path: read_kimi_key(),
+    "opencode": lambda _explicit_path: read_opencode_go_key(),
 }
 
 

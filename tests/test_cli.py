@@ -27,6 +27,7 @@ class OkTransport:
             "chatgpt.com": (FIXTURES / "codex_usage_full.json").read_bytes(),
             "api.z.ai": (FIXTURES / "zai_quota_full.json").read_bytes(),
             "api.kimi.com": (FIXTURES / "kimi_usages_full.json").read_bytes(),
+            "opencode.ai": (FIXTURES / "opencode_go_usage_full.json").read_bytes(),
         }
 
     def get(self, host, path, headers):
@@ -44,6 +45,7 @@ def readers(token=SENTINEL):
         "codex": lambda: token,
         "zai": lambda: token,
         "kimi": lambda: token,
+        "opencode": lambda: token,
     }
 
 
@@ -58,6 +60,7 @@ def isolated_home():
         "ZHIPU_API_KEY",
         "KIMI_API_KEY",
         "KIMI_CODE_HOME",
+        "XDG_DATA_HOME",
     ):
         os.environ.pop(var, None)
     return tmp
@@ -82,7 +85,7 @@ class ArgValidationTests(unittest.TestCase):
     def test_version_prints_version(self):
         code, out, err = self.run_cli(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("llmits 0.2.0", out)
+        self.assertIn("llmits 0.3.0", out)
 
     def test_unknown_provider_exits_two(self):
         code, out, err = self.run_cli(["--json", "--providers", "claude,grok"])
@@ -124,7 +127,7 @@ class JsonModeTests(unittest.TestCase):
         self.assertEqual(document["schema_version"], 1)
         self.assertEqual(len(out.strip().splitlines()) > 1, True)
         self.assertEqual(out.count("\n}\n"), 1)  # exactly one document
-        self.assertEqual(len(document["providers"]), 4)
+        self.assertEqual(len(document["providers"]), 5)
         self.assertNotIn(SENTINEL, out)
 
     def test_provider_subset_orders_output(self):
@@ -158,6 +161,7 @@ class JsonModeTests(unittest.TestCase):
                 "codex": "auth_required",
                 "zai": "auth_required",
                 "kimi": "auth_required",
+                "opencode": "auth_required",
             },
         )
         actions = " ".join(p["error"]["action"] for p in document["providers"])
@@ -165,6 +169,7 @@ class JsonModeTests(unittest.TestCase):
         self.assertIn("codex login", actions)
         self.assertIn("ZAI_API_KEY", actions)
         self.assertIn("kimi-cli", actions)
+        self.assertIn("OpenCode Go", actions)
 
     def test_ambiguous_kimi_environment_key_is_never_forwarded(self):
         original_env = dict(os.environ)
@@ -442,6 +447,7 @@ class DiagnoseModeTests(unittest.TestCase):
                 "codex: credential available · endpoint reachable · payload compatible",
                 "zai: credential available · endpoint reachable · payload compatible",
                 "kimi: credential available · endpoint reachable · payload compatible",
+                "opencode: credential available · endpoint reachable · payload compatible",
             ],
         )
 
@@ -613,6 +619,197 @@ class DiagnoseModeTests(unittest.TestCase):
             "claude: credential unavailable · endpoint not checked · payload not checked",
             out,
         )
+
+
+class OverviewModeTests(unittest.TestCase):
+    """--overview: one newline-terminated ASCII line of provider=state tokens."""
+
+    SENTINEL_TOKEN = "overview-sentinel-token"
+    SENTINEL_ERROR = "RuntimeError(overview-sentinel)"
+
+    def run_overview(self, argv, transport_factory=OkTransport, reader_map=None):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = cli.main(
+                    argv,
+                    transport_factory=transport_factory,
+                    credential_readers=reader_map or readers(self.SENTINEL_TOKEN),
+                )
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_configured_order_one_ascii_line_exit_zero(self):
+        code, out, err = self.run_overview(["--overview"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(out, "claude=47% codex=45% zai=53% kimi=42% opencode=42%\n")
+        self.assertTrue(out.isascii())
+        self.assertEqual(out.count("\n"), 1)
+
+    def test_subset_and_duplicate_providers_collapse_in_first_seen_order(self):
+        code, out, _ = self.run_overview(["--overview", "--providers", "kimi,zai,zai"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "kimi=42% zai=53%\n")
+
+    def test_urgency_order_reorders_tokens_only(self):
+        code, out, _ = self.run_overview(["--overview", "--order", "urgency"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "zai=53% claude=47% codex=45% kimi=42% opencode=42%\n")
+
+    def test_provider_failure_exits_one(self):
+        code, out, _ = self.run_overview(["--overview"], transport_factory=FailTransport)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            out,
+            "claude=auth_required codex=auth_required zai=auth_required kimi=auth_required opencode=auth_required\n",
+        )
+
+    def test_single_provider_failure_exits_one(self):
+        class OneFailingTransport:
+            def __init__(self):
+                self.ok = OkTransport()
+
+            def get(self, host, path, headers):
+                if host == "api.z.ai":
+                    return Response(401, b"denied")
+                return self.ok.get(host, path, headers)
+
+        code, out, _ = self.run_overview(["--overview"], transport_factory=OneFailingTransport)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "claude=47% codex=45% zai=auth_required kimi=42% opencode=42%\n")
+
+    def test_mutually_exclusive_with_json_and_diagnose(self):
+        for argv in (["--overview", "--json"], ["--overview", "--diagnose"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_overview(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("not allowed with argument", err)
+
+    def test_order_urgency_is_rejected_outside_overview(self):
+        for argv in (
+            ["--json", "--order", "urgency"],
+            ["--diagnose", "--order", "urgency"],
+            ["--providers", "claude", "--order", "urgency"],
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_overview(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn("--order urgency requires --overview", err)
+
+    def test_order_configured_stays_a_json_noop_with_schema_unchanged(self):
+        code, out, _ = self.run_overview(
+            ["--json", "--providers", "claude", "--order", "configured"]
+        )
+        self.assertEqual(code, 0)
+        document = json.loads(out)
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(
+            set(document["providers"][0]),
+            {"provider", "status", "plan_name", "fetched_at", "stale", "windows", "error"},
+        )
+
+    def test_fail_used_percent_stays_json_only(self):
+        code, out, err = self.run_overview(["--overview", "--fail-used-percent", "50"])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--fail-used-percent requires --json", err)
+
+    def test_overview_works_without_a_tty(self):
+        stdout_is_tty = sys.stdout.isatty
+        sys.stdout.isatty = lambda: False
+        try:
+            code, out, err = self.run_overview(["--overview", "--providers", "claude"])
+        finally:
+            sys.stdout.isatty = stdout_is_tty
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "claude=47%\n")
+        self.assertEqual(err, "")
+
+    def test_raising_transport_factory_exits_two_without_stdout(self):
+        def raising_transport_factory():
+            raise RuntimeError(self.SENTINEL_ERROR)
+
+        code, out, err = self.run_overview(
+            ["--overview"], transport_factory=raising_transport_factory
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(self.SENTINEL_ERROR, err)
+        self.assertIn("fatal internal error during refresh", err)
+
+    def test_non_fixed_provider_id_fails_closed_without_stdout(self):
+        """A snapshot the formatter must reject produces exit 2, no stdout.
+
+        The real pipeline only produces fixed ids, so this injects the
+        hostile snapshot at the RefreshService seam and proves the real
+        formatter plus the real fatal path contain it: fixed stderr text,
+        exit 2, and no hostile bytes on either stream.
+        """
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        from llmits.models import AVAILABLE, ProviderSnapshot
+
+        hostile = ProviderSnapshot(
+            provider=f"evil\nx=99% {self.SENTINEL_TOKEN}",
+            status=AVAILABLE,
+            plan_name=None,
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+        class HostileRefreshService:
+            def __init__(self, provider_ids, **kwargs):
+                pass
+
+            def refresh(self):
+                return (hostile,)
+
+            def close(self):
+                pass
+
+        with patch.object(cli, "RefreshService", HostileRefreshService):
+            code, out, err = self.run_overview(["--overview"])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "llmits: fatal internal error formatting the overview line\n")
+        for stream in (out, err):
+            self.assertNotIn(self.SENTINEL_TOKEN, stream)
+            self.assertNotIn("evil", stream)
+        self.assertNotIn("Traceback", err)
+
+    def test_hostile_transport_and_credential_text_never_reaches_output(self):
+        from llmits.http import TransportError
+
+        class HostileTransport:
+            def __init__(inner_self):
+                inner_self.bodies = OkTransport().bodies
+
+            def get(inner_self, host, path, headers):
+                if host == "api.anthropic.com":
+                    raise TransportError(f"{self.SENTINEL_TOKEN} {self.SENTINEL_ERROR}")
+                return Response(200, inner_self.bodies[host])
+
+        code, out, err = self.run_overview(
+            ["--overview"],
+            transport_factory=HostileTransport,
+            reader_map=readers(self.SENTINEL_TOKEN),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "claude=network_error codex=45% zai=53% kimi=42% opencode=42%\n")
+        for stream in (out, err):
+            self.assertNotIn(self.SENTINEL_TOKEN, stream)
+            self.assertNotIn(self.SENTINEL_ERROR, stream)
+
+    def test_help_lists_overview_and_order(self):
+        code, out, err = self.run_overview(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--overview", out)
+        self.assertIn("--order", out)
 
 
 class FailUsedPercentTests(unittest.TestCase):
