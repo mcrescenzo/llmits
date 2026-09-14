@@ -9,6 +9,7 @@ class DisplayNameTests(unittest.TestCase):
         self.assertEqual(providers.display_name("claude"), "Claude")
         self.assertEqual(providers.display_name("codex"), "Codex")
         self.assertEqual(providers.display_name("zai"), "Z.AI")
+        self.assertEqual(providers.display_name("opencode"), "OpenCode")
 
     def test_unknown_provider_falls_back_to_the_raw_id(self):
         self.assertEqual(providers.display_name("grok"), "grok")

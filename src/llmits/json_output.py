@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from .models import AVAILABLE, ProviderSnapshot
+from .models import AVAILABLE, ProviderSnapshot, bounded_percent
+from .providers import PROVIDER_IDS
 
 SCHEMA_VERSION = 1
 
@@ -64,6 +65,78 @@ def to_document(snapshots, generated_at: datetime | None = None) -> str:
 
 def all_available(snapshots) -> bool:
     return all(snapshot.status == AVAILABLE for snapshot in snapshots)
+
+
+def _max_used_percent(snapshot) -> int:
+    """Highest window percentage of a snapshot, 0 when it has no windows.
+
+    Each value is re-clamped through ``bounded_percent``: the model does
+    not validate ``QuotaWindow.used_percent`` at construction, so a
+    manually built snapshot could carry a non-numeric, non-finite, or
+    out-of-range value. Clamping here keeps the overview line an ASCII
+    integer 0..100 even for such a snapshot.
+    """
+    return max(
+        (bounded_percent(window.used_percent) for window in snapshot.windows), default=0
+    )
+
+
+def overview_state(snapshot) -> str:
+    """The one ASCII ``<provider>=<state>`` state token for a snapshot.
+
+    Precedence: a failed snapshot renders its normalized fixed status; an
+    available snapshot with windows renders its highest window usage as
+    ``N%`` (``N%~`` when the numbers come from a retained last-good
+    snapshot); an available snapshot without windows renders the literal
+    ``available`` (or ``stale``). Plan names, window labels, error text, and
+    timestamps never participate.
+    """
+    if snapshot.status != AVAILABLE:
+        return str(snapshot.status)
+    if snapshot.windows:
+        suffix = "~" if snapshot.stale else ""
+        return f"{_max_used_percent(snapshot)}%{suffix}"
+    return "stale" if snapshot.stale else "available"
+
+
+def _urgency_key(snapshot) -> tuple:
+    """Sort key ranking snapshots from most to least urgent.
+
+    Category 0 is a failed provider, 1 a stale one (windowed or not), 2 a
+    fresh provider with windows ordered by highest usage descending (note
+    the negated percentage), and 3 a fresh provider without windows.
+    ``sorted()`` is stable, so equal keys keep their configured order.
+    """
+    if snapshot.status != AVAILABLE:
+        return (0,)
+    if snapshot.stale:
+        return (1,)
+    if snapshot.windows:
+        return (2, -_max_used_percent(snapshot))
+    return (3,)
+
+
+def overview_line(snapshots, order: str = "configured") -> str:
+    """The complete ``--overview`` line body (without its trailing newline).
+
+    Tokens ``<provider>=<state>`` join with single ASCII spaces in the given
+    snapshot order, which the CLI supplies already de-duplicated in
+    configured order. ``order="urgency"`` re-sorts them by urgency instead.
+    Only fixed provider ids render: ``ProviderSnapshot`` does not validate
+    ``provider``, so a snapshot carrying anything outside ``PROVIDER_IDS``
+    raises ``ValueError`` instead of injecting a newline, extra spaces, or
+    non-ASCII text into the one-line grammar.
+    """
+    if order == "urgency":
+        snapshots = sorted(snapshots, key=_urgency_key)
+    elif order != "configured":
+        raise ValueError(f"unknown overview order: {order!r}")
+    tokens = []
+    for snapshot in snapshots:
+        if snapshot.provider not in PROVIDER_IDS:
+            raise ValueError(f"unknown provider id: {snapshot.provider!r}")
+        tokens.append(f"{snapshot.provider}={overview_state(snapshot)}")
+    return " ".join(tokens)
 
 
 def used_percent_at_least(snapshots, threshold: int) -> bool:

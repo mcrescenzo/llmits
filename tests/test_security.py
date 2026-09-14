@@ -217,6 +217,7 @@ class HardcodedEndpointTests(unittest.TestCase):
             "chatgpt.com",
             "api.z.ai",
             "api.kimi.com",
+            "opencode.ai",
         ):
             self.assertIn(host, http_source)
         self.assertNotIn("http://", http_source.replace("https://", ""))
@@ -228,6 +229,7 @@ class HardcodedEndpointTests(unittest.TestCase):
             ("codex.py", "chatgpt.com", "/backend-api/wham/usage"),
             ("zai.py", "api.z.ai", "/api/monitor/usage/quota/limit"),
             ("kimi.py", "api.kimi.com", "/coding/v1/usages"),
+            ("opencode.py", "opencode.ai", "/zen/go/v1/usage"),
         ):
             source = (SRC / "providers" / module).read_text()
             self.assertIn(f'HOST = "{host}"', source)

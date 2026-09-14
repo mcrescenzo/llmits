@@ -15,7 +15,12 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 
 from . import __version__, auth
-from .json_output import all_available, to_document, used_percent_at_least
+from .json_output import (
+    all_available,
+    overview_line,
+    to_document,
+    used_percent_at_least,
+)
 from .models import (
     AUTH_REQUIRED,
     AVAILABLE,
@@ -35,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llmits",
         description=(
-            "Show Claude, Codex, Z.AI, and Kimi subscription limits in one terminal pane."
+            "Show Claude, Codex, Z.AI, Kimi, and OpenCode Go limits in one terminal pane."
         ),
     )
     output_mode = parser.add_mutually_exclusive_group()
@@ -50,6 +55,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "check credentials, fixed provider endpoints, and payload compatibility "
             "without printing secrets, then exit"
+        ),
+    )
+    output_mode.add_argument(
+        "--overview",
+        action="store_true",
+        help=(
+            "print one newline-terminated ASCII line of provider=state tokens and exit "
+            "(never starts the TUI; works without a terminal)"
+        ),
+    )
+    parser.add_argument(
+        "--order",
+        choices=("configured", "urgency"),
+        default="configured",
+        help=(
+            "with --overview: configured (default) keeps the de-duplicated provider "
+            "order; urgency sorts failures first, then stale providers, then available "
+            "providers with windows by highest used percent descending, then available "
+            "providers without windows (ties keep the configured order)"
         ),
     )
     parser.add_argument(
@@ -120,12 +144,18 @@ def main(
         if not 0 <= args.fail_used_percent <= 100:
             parser.error("--fail-used-percent must be an integer between 0 and 100")
 
+    if args.order == "urgency" and not args.overview:
+        parser.error("--order urgency requires --overview")
+
     readers = credential_readers or _credential_reader_map(
         args.claude_credentials, args.codex_credentials
     )
 
     if args.json:
         return _run_json(provider_ids, transport_factory, readers, args.fail_used_percent)
+
+    if args.overview:
+        return _run_overview(provider_ids, transport_factory, readers, args.order)
 
     if args.diagnose:
         return _run_diagnose(provider_ids, readers, transport_factory)
@@ -157,6 +187,37 @@ def _run_json(provider_ids, transport_factory, readers, fail_used_percent=None) 
     if fail_used_percent is not None and used_percent_at_least(snapshots, fail_used_percent):
         return 3
     return 0
+
+
+def _run_overview(provider_ids, transport_factory, readers, order: str) -> int:
+    """One-shot --overview mode: print the single overview line and exit.
+
+    Mirrors ``_run_json``: same refresh path, same fatal-error handling, and
+    the same exit contract minus the JSON-only threshold -- a stale retained
+    snapshot still counts as available, so only a provider failure exits 1.
+    The formatter itself only accepts fixed provider ids, and a formatter
+    failure is a fatal internal error (exit 2, fixed stderr text).
+    """
+    service = RefreshService(
+        provider_ids, transport_factory=transport_factory, credential_readers=readers
+    )
+    try:
+        snapshots = service.refresh()
+    except Exception:
+        print("llmits: fatal internal error during refresh", file=sys.stderr)
+        return 2
+    finally:
+        service.close()
+    try:
+        line = overview_line(snapshots, order)
+    except Exception:
+        # Fail closed with fixed local text: a snapshot the formatter must
+        # reject (e.g. a non-fixed provider id) never reaches stdout, and
+        # its hostile value never reaches stderr through a traceback.
+        print("llmits: fatal internal error formatting the overview line", file=sys.stderr)
+        return 2
+    print(line)
+    return 0 if all_available(snapshots) else 1
 
 
 _DIAGNOSTIC_OUTCOMES: Mapping[str, tuple[str, str]] = {

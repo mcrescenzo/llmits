@@ -22,7 +22,9 @@ from dataclasses import dataclass
 
 TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 1024 * 1024
-ALLOWED_HOSTS = frozenset({"api.anthropic.com", "chatgpt.com", "api.z.ai", "api.kimi.com"})
+ALLOWED_HOSTS = frozenset(
+    {"api.anthropic.com", "chatgpt.com", "api.z.ai", "api.kimi.com", "opencode.ai"}
+)
 
 
 class TransportError(Exception):

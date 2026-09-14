@@ -169,6 +169,8 @@ class ArchiveManifestTests(unittest.TestCase):
             "ZHIPU_API_KEY",
             "KIMI_API_KEY",
             "KIMI_CODE_HOME",
+            "XDG_DATA_HOME",
+            "OPENCODE_AUTH_CONTENT",
         ):
             env.pop(var, None)
 
@@ -191,6 +193,7 @@ class ArchiveManifestTests(unittest.TestCase):
                 "codex": "auth_required",
                 "zai": "auth_required",
                 "kimi": "auth_required",
+                "opencode": "auth_required",
             },
         )
 

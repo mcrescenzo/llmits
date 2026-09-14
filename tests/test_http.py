@@ -72,7 +72,7 @@ class AllowlistTests(TransportHarness):
     def test_allowlist_covers_exactly_the_provider_hosts(self):
         self.assertEqual(
             ll_http.ALLOWED_HOSTS,
-            {"api.anthropic.com", "chatgpt.com", "api.z.ai", "api.kimi.com"},
+            {"api.anthropic.com", "chatgpt.com", "api.z.ai", "api.kimi.com", "opencode.ai"},
         )
 
     def test_disallowed_host_is_refused_without_network(self):

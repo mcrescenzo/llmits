@@ -19,8 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llmits.http import TransportError
-from llmits.models import AUTH_REQUIRED, AVAILABLE, NETWORK_ERROR, PARSE_ERROR, UNAVAILABLE
-from llmits.providers import FETCHERS, PROVIDER_IDS, claude, codex, kimi, zai
+from llmits.models import (
+    AUTH_REQUIRED,
+    AVAILABLE,
+    NETWORK_ERROR,
+    PARSE_ERROR,
+    UNAVAILABLE,
+    ProviderStatus,
+)
+from llmits.providers import FETCHERS, PROVIDER_IDS, claude, codex, kimi, opencode, zai
 
 FIXTURES = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
@@ -38,6 +45,7 @@ class ProviderCase:
     plan_name: str
     window_keys: tuple[str, ...]
     auth_attempts: int  # transport GETs a single 401/403 response triggers
+    forbidden_status: ProviderStatus
 
 
 CASES: dict[str, ProviderCase] = {
@@ -55,6 +63,7 @@ CASES: dict[str, ProviderCase] = {
             "extra_credits",
         ),
         auth_attempts=1,
+        forbidden_status=AUTH_REQUIRED,
     ),
     "codex": ProviderCase(
         provider_id="codex",
@@ -63,6 +72,7 @@ CASES: dict[str, ProviderCase] = {
         plan_name="Codex plus",
         window_keys=("5h", "7d", "spk/7d", "credits", "reset_credits"),
         auth_attempts=1,
+        forbidden_status=AUTH_REQUIRED,
     ),
     "zai": ProviderCase(
         provider_id="zai",
@@ -72,6 +82,7 @@ CASES: dict[str, ProviderCase] = {
         window_keys=("5h", "weekly", "monthly_mcp"),
         # 401/403 retries once with a Bearer header before giving up.
         auth_attempts=2,
+        forbidden_status=AUTH_REQUIRED,
     ),
     "kimi": ProviderCase(
         provider_id="kimi",
@@ -80,6 +91,16 @@ CASES: dict[str, ProviderCase] = {
         plan_name="Kimi Coding Plan",
         window_keys=("5h", "weekly"),
         auth_attempts=1,
+        forbidden_status=AUTH_REQUIRED,
+    ),
+    "opencode": ProviderCase(
+        provider_id="opencode",
+        module=opencode,
+        fixture="opencode_go_usage_full.json",
+        plan_name="OpenCode Go",
+        window_keys=("5h", "weekly", "monthly"),
+        auth_attempts=1,
+        forbidden_status=UNAVAILABLE,
     ),
 }
 
@@ -183,7 +204,7 @@ class ProviderConformanceTests(unittest.TestCase):
                     self.assertNotIn(BODY_SENTINEL, text)
                     self.assertNotIn(SENTINEL, text)
 
-    def test_authentication_failure_is_auth_required_without_leakage(self):
+    def test_authentication_or_entitlement_failure_is_normalized_without_leakage(self):
         for provider_id in PROVIDER_IDS:
             case = CASES[provider_id]
             for status in (401, 403):
@@ -191,7 +212,8 @@ class ProviderConformanceTests(unittest.TestCase):
                     body = f'{{"error": "denied {BODY_SENTINEL}"}}'.encode()
                     transport = ScriptedTransport(lambda *_: Response(status, body))
                     snapshot = case.module.fetch(SENTINEL, transport, now=NOW)
-                    self.assertEqual(snapshot.status, AUTH_REQUIRED)
+                    expected = AUTH_REQUIRED if status == 401 else case.forbidden_status
+                    self.assertEqual(snapshot.status, expected)
                     self.assertEqual(len(transport.calls), case.auth_attempts)
                     for host, path, headers in transport.calls:
                         self.assertEqual((host, path), (case.module.HOST, case.module.PATH))

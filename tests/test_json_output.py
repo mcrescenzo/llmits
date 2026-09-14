@@ -1,5 +1,6 @@
 import json
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,6 +9,9 @@ from llmits.models import (
     AVAILABLE,
     AUTH_REQUIRED,
     NETWORK_ERROR,
+    PARSE_ERROR,
+    RATE_LIMITED,
+    UNAVAILABLE,
     ProviderError,
     ProviderSnapshot,
     QuotaWindow,
@@ -159,6 +163,269 @@ class JsonOutputTests(unittest.TestCase):
             self.assertTrue(value is None or isinstance(value, int))
             self.assertNotIsInstance(value, bool)
 
+
+
+class OverviewLineTests(unittest.TestCase):
+    """json_output.overview_line / overview_state: the --overview one-line format."""
+
+    @staticmethod
+    def _snapshot(
+        provider="claude",
+        status=AVAILABLE,
+        percents=(),
+        stale=False,
+        error=None,
+        plan_name="Claude Pro/Max",
+        windows=None,
+    ):
+        if windows is None:
+            windows = tuple(
+                QuotaWindow(
+                    key=f"w{i}",
+                    label=f"window {i}",
+                    used_percent=percent,
+                    remaining_percent=100 - percent,
+                )
+                for i, percent in enumerate(percents)
+            )
+        return ProviderSnapshot(
+            provider=provider,
+            status=status,
+            plan_name=plan_name,
+            fetched_at=FETCHED_AT,
+            windows=windows,
+            stale=stale,
+            error=error,
+        )
+
+    @staticmethod
+    def _failed(provider, code, message="upstream reported an error"):
+        return ProviderSnapshot(
+            provider=provider,
+            status=code,
+            plan_name=None,
+            fetched_at=FETCHED_AT,
+            error=ProviderError(code=code, message=message, action="retry later"),
+        )
+
+    def test_all_five_output_states(self):
+        cases = (
+            (self._snapshot(percents=(42,)), "claude=42%"),
+            (self._snapshot(percents=(42,), stale=True), "claude=42%~"),
+            (self._snapshot(), "claude=available"),
+            (self._snapshot(stale=True), "claude=stale"),
+            (self._failed("claude", NETWORK_ERROR), "claude=network_error"),
+        )
+        for snapshot, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(json_output.overview_line([snapshot]), expected)
+                self.assertEqual(json_output.overview_state(snapshot), expected.split("=", 1)[1])
+
+    def test_failed_status_outranks_windows(self):
+        snapshot = replace(
+            self._failed("zai", PARSE_ERROR),
+            windows=(QuotaWindow(key="5h", label="5h", used_percent=9, remaining_percent=91),),
+        )
+        self.assertEqual(json_output.overview_line([snapshot]), "zai=parse_error")
+
+    def test_stale_windowed_state_still_counts_as_available(self):
+        stale = self._snapshot(percents=(31,), stale=True)
+        self.assertEqual(json_output.overview_line([stale]), "claude=31%~")
+        self.assertTrue(json_output.all_available([stale]))
+
+    def test_maximum_percent_across_multiple_windows(self):
+        self.assertEqual(
+            json_output.overview_line([self._snapshot(percents=(7, 91, 13))]),
+            "claude=91%",
+        )
+
+    def test_every_normalized_failure_status_renders_verbatim(self):
+        for code in (AUTH_REQUIRED, UNAVAILABLE, RATE_LIMITED, NETWORK_ERROR, PARSE_ERROR):
+            with self.subTest(code=str(code)):
+                self.assertEqual(
+                    json_output.overview_line([self._failed("codex", code)]),
+                    f"codex={code}",
+                )
+
+    def test_tokens_join_with_single_ascii_spaces_in_given_order(self):
+        snapshots = [
+            self._snapshot("kimi", percents=(10,)),
+            self._failed("claude", AUTH_REQUIRED),
+            self._snapshot("zai", percents=(99,)),
+        ]
+        line = json_output.overview_line(snapshots)
+        self.assertEqual(line, "kimi=10% claude=auth_required zai=99%")
+        self.assertEqual(line.count(" "), len(snapshots) - 1)
+        self.assertTrue(line.isascii())
+
+    def test_configured_order_is_the_default(self):
+        snapshots = [
+            self._snapshot("claude", percents=(10,)),
+            self._snapshot("zai", percents=(90,)),
+            self._failed("kimi", RATE_LIMITED),
+        ]
+        self.assertEqual(
+            json_output.overview_line(snapshots, "configured"),
+            json_output.overview_line(snapshots),
+        )
+
+    def test_urgency_order_ranks_failed_then_stale_then_windowed_then_windowless(self):
+        snapshots = [
+            self._snapshot("zai", percents=(10,)),  # fresh windowed, lowest
+            self._snapshot("kimi"),  # fresh windowless
+            self._snapshot("claude", percents=(30,), stale=True),  # stale windowed
+            self._failed("codex", RATE_LIMITED),  # failed
+            self._snapshot("zai", percents=(80,)),  # fresh windowed, highest
+            self._snapshot("claude", stale=True),  # stale windowless
+        ]
+        self.assertEqual(
+            json_output.overview_line(snapshots, "urgency"),
+            "codex=rate_limited claude=30%~ claude=stale zai=80% zai=10% kimi=available",
+        )
+        # configured order is untouched by the same call sequence
+        self.assertEqual(
+            json_output.overview_line(snapshots),
+            "zai=10% kimi=available claude=30%~ codex=rate_limited zai=80% claude=stale",
+        )
+
+    def test_urgency_orders_fresh_windowed_by_max_percent_descending(self):
+        snapshots = [
+            self._snapshot("claude", percents=(5, 20)),
+            self._snapshot("kimi", percents=(60,)),
+            self._snapshot("zai", percents=(40, 50)),
+        ]
+        self.assertEqual(
+            json_output.overview_line(snapshots, "urgency"),
+            "kimi=60% zai=50% claude=20%",
+        )
+
+    def test_urgency_sort_is_stable_on_ties(self):
+        snapshots = [
+            self._snapshot("zai", percents=(40,)),
+            self._snapshot("claude", percents=(40,)),
+            self._failed("kimi", UNAVAILABLE),
+            self._failed("codex", PARSE_ERROR),
+            self._snapshot("zai", stale=True),
+            self._snapshot("claude", stale=True),
+        ]
+        self.assertEqual(
+            json_output.overview_line(snapshots, "urgency"),
+            "kimi=unavailable codex=parse_error zai=stale claude=stale zai=40% claude=40%",
+        )
+
+    def test_unknown_order_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            json_output.overview_line([self._snapshot()], "alphabetical")
+        self.assertIn("unknown overview order", str(ctx.exception))
+
+
+class OverviewHostileDataTests(unittest.TestCase):
+    """Overview renders fixed ids, statuses, and bounded integers only.
+
+    ``QuotaWindow.used_percent`` is not validated at construction, so these
+    snapshots are built by hand (like a model bypassing adapter
+    normalization) to prove the formatter itself keeps the line ASCII and
+    bounded. Plan names, window labels, and error text must never render.
+    """
+
+    HOSTILE_PLAN = "claude=99% PLAN-SENTINEL-9x"
+    HOSTILE_LABEL = "label\u202e SENTINEL \x1b]0;pwn\x07"
+    HOSTILE_PERCENT = "percent-SENTINEL-9x"
+
+    def _window(self, used_percent):
+        return QuotaWindow(
+            key="5h",
+            label=self.HOSTILE_LABEL,
+            used_percent=used_percent,
+            remaining_percent=0,
+        )
+
+    def _snapshot(self, status=AVAILABLE, used_percent=0, error=None):
+        return ProviderSnapshot(
+            provider="claude",
+            status=status,
+            plan_name=self.HOSTILE_PLAN,
+            fetched_at=FETCHED_AT,
+            windows=(self._window(used_percent),),
+            error=error,
+        )
+
+    def test_non_numeric_used_percent_renders_zero(self):
+        self.assertEqual(
+            json_output.overview_line([self._snapshot(used_percent=self.HOSTILE_PERCENT)]),
+            "claude=0%",
+        )
+
+    def test_non_finite_used_percent_renders_zero(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    json_output.overview_line([self._snapshot(used_percent=bad)]),
+                    "claude=0%",
+                )
+
+    def test_out_of_range_used_percent_clamps_to_100(self):
+        for high in (250, 1000000):
+            with self.subTest(high=high):
+                self.assertEqual(
+                    json_output.overview_line([self._snapshot(used_percent=high)]),
+                    "claude=100%",
+                )
+
+    def test_fractional_used_percent_renders_a_bounded_integer(self):
+        self.assertEqual(
+            json_output.overview_line([self._snapshot(used_percent=47.2)]),
+            "claude=47%",
+        )
+
+    def test_hostile_plan_label_and_error_text_never_reach_the_line(self):
+        snapshots = [
+            self._snapshot(used_percent=42),
+            self._snapshot(
+                status=PARSE_ERROR,
+                used_percent=99,
+                error=ProviderError(
+                    code=PARSE_ERROR,
+                    message="message " + self.HOSTILE_PERCENT,
+                    action="action " + self.HOSTILE_PERCENT,
+                ),
+            ),
+        ]
+        line = json_output.overview_line(snapshots, "urgency")
+        self.assertEqual(line, "claude=parse_error claude=42%")
+        self.assertTrue(line.isascii())
+        for hostile in (self.HOSTILE_PLAN, self.HOSTILE_PERCENT, "SENTINEL", "9x"):
+            self.assertNotIn(hostile, line)
+
+    def test_non_fixed_provider_ids_are_rejected_not_rendered(self):
+        """A provider id outside PROVIDER_IDS can never inject line breaks.
+
+        ``ProviderSnapshot`` does not validate ``provider``, so the formatter
+        itself must keep the fixed-id promise: rendering such a snapshot
+        would emit a second line (or non-ASCII text), so it raises instead.
+        """
+        hostile_ids = (
+            "evil\nx=99%",
+            "claude\tx=99%",
+            "claudé",
+            "claude ",
+            "",
+            "SENTINEL-9x",
+        )
+        for hostile in hostile_ids:
+            with self.subTest(hostile=repr(hostile)):
+                snapshot = ProviderSnapshot(
+                    provider=hostile,
+                    status=AVAILABLE,
+                    plan_name=self.HOSTILE_PLAN,
+                    fetched_at=FETCHED_AT,
+                    windows=(self._window(42),),
+                )
+                for order in ("configured", "urgency"):
+                    with self.subTest(order=order):
+                        with self.assertRaises(ValueError) as ctx:
+                            json_output.overview_line([snapshot], order)
+                        self.assertIn("unknown provider id", str(ctx.exception))
 
 
 class ShortLabelDocumentTests(unittest.TestCase):
