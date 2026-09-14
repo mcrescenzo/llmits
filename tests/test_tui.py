@@ -260,18 +260,30 @@ class RenderTests(unittest.TestCase):
     # -- footer: pinned, DIM, refreshing prefix -------------------------------
 
     def test_footer_idle_text(self):
-        footer = tui._footer_text(view(loading=False), tui.UNICODE_GLYPHS)
+        footer = tui._footer_text(view(loading=False), tui.UNICODE_GLYPHS, scrollable=True)
         self.assertEqual(
             footer,
             "r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all",
         )
 
     def test_footer_refreshing_prefix(self):
-        footer = tui._footer_text(view(loading=True), tui.UNICODE_GLYPHS)
+        footer = tui._footer_text(view(loading=True), tui.UNICODE_GLYPHS, scrollable=True)
         self.assertEqual(
             footer,
             "refreshing…  ·  r/R refresh  ·  j/k scroll  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all",
         )
+
+    def test_footer_hides_scroll_hint_when_content_fits(self):
+        frame = tui.render(view((snapshot(windows=(full_window(10),)),)), 120, 40)
+        self.assertEqual(frame.max_scroll, 0)
+        footer = text(frame.lines[-1:])[0]
+        self.assertNotIn("j/k scroll", footer)
+
+    def test_footer_shows_scroll_hint_when_content_overflows(self):
+        frame = tui.render(view(scroll_fixture()), 60, 15)
+        self.assertGreater(frame.max_scroll, 0)
+        footer = text(frame.lines[-1:])[0]
+        self.assertIn("j/k scroll", footer)
 
     def test_footer_is_last_row_and_dim(self):
         frame = tui.render(view((snapshot(windows=(full_window(10),)),)), 120, 40)
@@ -283,7 +295,7 @@ class RenderTests(unittest.TestCase):
     def test_footer_lists_both_q_and_esc_as_quit_keys(self):
         # rank 90: a monochrome or screen-reader-piped terminal must still
         # learn both quit keys from the footer text itself.
-        footer = tui._footer_text(view(loading=False), tui.UNICODE_GLYPHS)
+        footer = tui._footer_text(view(loading=False), tui.UNICODE_GLYPHS, scrollable=False)
         self.assertIn("q", footer)
         self.assertIn("esc", footer)
 
@@ -1067,7 +1079,7 @@ class FocusToolkitRenderTests(unittest.TestCase):
         self.assertEqual(open_frame.max_scroll - shut_frame.max_scroll, 6)
 
     def test_footer_lists_focus_toolkit_keys(self):
-        footer = tui._footer_text(view(), tui.UNICODE_GLYPHS)
+        footer = tui._footer_text(view(), tui.UNICODE_GLYPHS, scrollable=True)
         for hint in (
             "r/R refresh",
             "tab focus",
