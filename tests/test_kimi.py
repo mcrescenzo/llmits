@@ -83,6 +83,38 @@ class KimiParseTests(unittest.TestCase):
         (window,) = kimi.parse_usage(payload)
         self.assertIsNone(window.reset_at)
 
+    def test_rfc3339_timezone_overflow_clears_the_reset(self):
+        payload = {
+            "usage": {
+                "limit": 10,
+                "remaining": 5,
+                "resetTime": "9999-12-31T23:59:59-23:59",
+            }
+        }
+        (window,) = kimi.parse_usage(payload)
+        self.assertEqual(window.used_percent, 50)
+        self.assertIsNone(window.reset_at)
+
+    def test_oversized_integer_numeric_fields_are_skipped(self):
+        oversized = 10**310
+        self.assertEqual(
+            kimi.parse_usage({"usage": {"limit": oversized, "remaining": 1}}),
+            (),
+        )
+        windows = kimi.parse_usage(
+            {
+                "usage": {"limit": 10, "remaining": 5},
+                "limits": [
+                    {
+                        "duration": oversized,
+                        "timeUnit": "TIME_UNIT_MINUTE",
+                        "detail": {"limit": 10, "remaining": 5},
+                    }
+                ],
+            }
+        )
+        self.assertEqual([window.key for window in windows], ["weekly"])
+
     def test_used_field_overrides_derived_difference(self):
         payload = {"usage": {"limit": 100, "remaining": 10, "used": 25}}
         (window,) = kimi.parse_usage(payload)

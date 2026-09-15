@@ -89,7 +89,7 @@ Z.AI  [Z.AI pro]  ● stale · 6m ago
   5h      ━━━─────────────────────────────────────    7%  resets now
   last update failed: provider server error (HTTP 503)
 
-r/R refresh  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show all
+r/R refresh  ·  q/esc quit  ·  tab focus  ·  h hide  ·  c collapse  ·  a show a
 ```
 
 Exit codes: `0` success, `1` a requested provider failed (this outranks the threshold result), `2` invalid invocation, non-TTY interactive run, or a fatal internal error, `3` every requested provider succeeded but a window met the `--fail-used-percent` threshold (`--json`-only; `--overview` never exits `3`), `130` if the TUI is interrupted (Ctrl-C).

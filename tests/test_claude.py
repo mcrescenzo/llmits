@@ -66,6 +66,30 @@ class ClaudeParseTests(unittest.TestCase):
     def test_empty_payload_yields_no_windows(self):
         self.assertEqual(claude.parse_usage({}), ())
 
+    def test_boolean_numeric_fields_are_rejected(self):
+        payloads = (
+            {"five_hour": {"utilization": True}},
+            {
+                "limits": [
+                    {
+                        "group": "weekly",
+                        "percent": True,
+                        "scope": {"model": {"display_name": "Opus"}},
+                    }
+                ]
+            },
+            {
+                "extra_usage": {
+                    "is_enabled": True,
+                    "monthly_limit": True,
+                    "used_credits": True,
+                }
+            },
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(claude.parse_usage(payload), ())
+
 
 class ClaudeFetchTests(unittest.TestCase):
     def test_success_snapshot(self):
@@ -139,6 +163,37 @@ class ClaudeFetchTests(unittest.TestCase):
         transport = FakeTransport(Response(200, json.dumps(payload)))
         snapshot = claude.fetch(SENTINEL, transport, now=NOW)
         self.assertEqual(snapshot.windows[0].used_percent, 0)
+
+    def test_oversized_integer_normalizes_without_dropping_other_windows(self):
+        payload = {
+            "five_hour": {"utilization": 10**310},
+            "seven_day": {"utilization": 25, "resets_at": "2026-07-20T00:00:00Z"},
+        }
+        snapshot = claude.fetch(
+            SENTINEL, FakeTransport(Response(200, json.dumps(payload))), now=NOW
+        )
+        self.assertEqual(snapshot.status, AVAILABLE)
+        self.assertEqual([window.key for window in snapshot.windows], ["5h", "weekly"])
+        self.assertEqual(snapshot.windows[0].used_percent, 0)
+        self.assertEqual(snapshot.windows[1].used_percent, 25)
+
+    def test_rfc3339_timezone_overflow_clears_only_the_reset(self):
+        payload = {
+            "five_hour": {
+                "utilization": 10,
+                "resets_at": "0001-01-01T00:00:00+23:59",
+            },
+            "seven_day": {"utilization": 20, "resets_at": "2026-07-20T00:00:00Z"},
+        }
+        snapshot = claude.fetch(
+            SENTINEL, FakeTransport(Response(200, json.dumps(payload))), now=NOW
+        )
+        self.assertEqual(snapshot.status, AVAILABLE)
+        self.assertIsNone(snapshot.windows[0].reset_at)
+        self.assertEqual(
+            snapshot.windows[1].reset_at,
+            datetime(2026, 7, 20, tzinfo=timezone.utc),
+        )
 
 
 class ClaudeDefaultClockTests(unittest.TestCase):

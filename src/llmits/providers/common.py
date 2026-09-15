@@ -45,8 +45,11 @@ def _retry_after_text(value: str | None) -> str:
     if not value:
         return ""
     text = value.strip()
-    if text.isdigit():
-        seconds = min(int(text), _RETRY_AFTER_MAX_SECONDS)
+    if text.isascii() and text.isdecimal():
+        try:
+            seconds = min(int(text), _RETRY_AFTER_MAX_SECONDS)
+        except ValueError:
+            return ""
         if seconds > 0:
             return f"; retry in {seconds}s"
     return ""
@@ -158,9 +161,12 @@ def epoch_to_datetime(value, *, millis: bool = False) -> datetime | None:
     contract of ``bounded_int``/``bounded_percent`` in models.py and
     ``claude._parse_rfc3339``'s try/except around ``fromisoformat``.
     """
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     if not math.isfinite(number):
         return None
     if millis:

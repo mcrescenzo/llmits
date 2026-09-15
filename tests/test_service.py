@@ -99,6 +99,29 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(by_id["codex"].status, AVAILABLE)
         self.assertEqual(by_id["zai"].status, AVAILABLE)
 
+    def test_unexpected_credential_reader_failure_is_isolated(self):
+        def broken():
+            raise RuntimeError("secret credential path must not surface")
+
+        mixed = readers()
+        mixed["claude"] = broken
+        snapshots = self.make_service(
+            FakeTransport(by_host), readers_map=mixed
+        ).refresh()
+        by_id = {snapshot.provider: snapshot for snapshot in snapshots}
+
+        self.assertEqual(by_id["claude"].status, AUTH_REQUIRED)
+        self.assertEqual(
+            by_id["claude"].error.message,
+            "credential discovery failed (RuntimeError)",
+        )
+        self.assertNotIn(
+            "secret",
+            by_id["claude"].error.message + by_id["claude"].error.action,
+        )
+        self.assertEqual(by_id["codex"].status, AVAILABLE)
+        self.assertEqual(by_id["zai"].status, AVAILABLE)
+
     def test_unknown_provider_rejected(self):
         with self.assertRaises(ValueError):
             self.make_service(FakeTransport(), ids=("claude", "grok"))
@@ -261,17 +284,55 @@ class DefaultTransportWiringTests(unittest.TestCase):
 
 
 class ConcurrentRefreshTests(unittest.TestCase):
-    """RefreshService holds shared mutable _last_good behind self._lock so a
-    manual refresh can safely race the auto-refresh timer. Two threads drive
-    real refresh() calls for the same provider through a barrier so their
-    post-fetch critical sections actually overlap, one seeing success and one
-    seeing failure each round, proving the lock keeps _last_good coherent
-    under real contention instead of merely being present but unexercised.
-    """
+    """Exercise the lock around shared ``_last_good`` reads and writes."""
 
-    def test_concurrent_refresh_calls_never_corrupt_or_lose_last_good_state(self):
+    def test_concurrent_refresh_calls_hold_the_lock_under_real_contention(self):
         barrier = threading.Barrier(2)
-        rounds_per_thread = 20
+        rounds_per_thread = 10
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._owner = None
+                self._arrival = threading.Barrier(2)
+                self.synchronize_arrivals = True
+                self.contentions = 0
+
+            def __enter__(self):
+                if self.synchronize_arrivals:
+                    self._arrival.wait(timeout=5)
+                if not self._lock.acquire(blocking=False):
+                    self.contentions += 1
+                    self._lock.acquire()
+                self._owner = threading.get_ident()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self._owner = None
+                self._lock.release()
+
+            def held_by_current_thread(self):
+                return self._owner == threading.get_ident()
+
+        class GuardedState(dict):
+            def __init__(self, lock, values):
+                super().__init__(values)
+                self._lock = lock
+
+            def _assert_locked(self):
+                if not self._lock.held_by_current_thread():
+                    raise AssertionError("_last_good accessed without the refresh lock")
+
+            def __setitem__(self, key, value):
+                self._assert_locked()
+                # Keep the success writer in the critical section long enough
+                # for its barrier-paired failure reader to contend reliably.
+                time.sleep(0.01)
+                return super().__setitem__(key, value)
+
+            def get(self, key, default=None):
+                self._assert_locked()
+                return super().get(key, default)
 
         class AlternatingTransport:
             def __init__(self):
@@ -287,17 +348,18 @@ class ConcurrentRefreshTests(unittest.TestCase):
                     return Response(500, b"boom")
                 return by_host(host, path, headers)
 
-        seed_transport = FakeTransport(by_host)
         svc = service.RefreshService(
             ("claude",),
-            transport_factory=lambda: seed_transport,
+            transport_factory=lambda: FakeTransport(by_host),
             credential_readers=readers(),
         )
-        # Seed _last_good with a real success outside the barrier (a lone
-        # refresh() here would deadlock: the barrier needs two arrivals).
         seed = svc.refresh()
         self.assertEqual(seed[0].status, AVAILABLE)
 
+        tracking_lock = TrackingLock()
+        guarded_state = GuardedState(tracking_lock, svc._last_good)
+        svc._lock = tracking_lock
+        svc._last_good = guarded_state
         transport = AlternatingTransport()
         svc._transport_factory = lambda: transport
 
@@ -311,25 +373,25 @@ class ConcurrentRefreshTests(unittest.TestCase):
                     snapshots = svc.refresh()
                     with results_lock:
                         results.append(snapshots[0])
-            except Exception as exc:  # pragma: no cover - failure path
+            except Exception as exc:  # pragma: no cover - asserted below
                 errors.append(exc)
 
         threads = [threading.Thread(target=worker) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
 
-        self.assertFalse(any(t.is_alive() for t in threads), "worker thread hung")
+        self.assertFalse(any(thread.is_alive() for thread in threads), "worker thread hung")
         self.assertEqual(errors, [])
+        self.assertGreater(tracking_lock.contentions, 0, "test never exercised lock contention")
         self.assertEqual(len(results), 2 * rounds_per_thread)
-        # Every result the lock hands back — fresh success or stale
-        # fallback — must carry the established plan_name and windows; a
-        # torn or lost update under the lock would show up as one missing.
         for snapshot in results:
             self.assertEqual(snapshot.plan_name, seed[0].plan_name)
             self.assertEqual(snapshot.windows, seed[0].windows)
-        last_good = svc._last_good.get("claude")
+        tracking_lock.synchronize_arrivals = False
+        with tracking_lock:
+            last_good = guarded_state.get("claude")
         self.assertIsNotNone(last_good)
         self.assertEqual(last_good.status, AVAILABLE)
 

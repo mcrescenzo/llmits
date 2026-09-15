@@ -16,6 +16,8 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import package  # noqa: E402
 
+from tests import support  # noqa: E402
+
 
 def shutil_copytree(source: Path, target: Path) -> None:
     import shutil
@@ -156,22 +158,15 @@ class ArchiveManifestTests(unittest.TestCase):
         # provider's credential lookup fails before any transport is used, so
         # this exercises the real zipimport --json path (RefreshService,
         # the production credential reader map, JSON serialization, and the
-        # entry point's own exit code) without touching the network.
+        # entry point's own exit code) without touching the network. The shared
+        # list is the same one the in-process tests clear; a hand-rolled copy
+        # here already drifted once, letting an exported CODEX_HOME reach a
+        # real credential and the live network.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         env = dict(os.environ)
         env["HOME"] = home.name
-        for var in (
-            "LLMITS_CLAUDE_CREDENTIALS",
-            "LLMITS_CODEX_CREDENTIALS",
-            "CLAUDE_CONFIG_DIR",
-            "ZAI_API_KEY",
-            "ZHIPU_API_KEY",
-            "KIMI_API_KEY",
-            "KIMI_CODE_HOME",
-            "XDG_DATA_HOME",
-            "OPENCODE_AUTH_CONTENT",
-        ):
+        for var in support.CREDENTIAL_ENV_VARS:
             env.pop(var, None)
 
         result = subprocess.run(

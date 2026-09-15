@@ -87,6 +87,7 @@ class TuiView:
     refresh_seconds: int
     version: str
     now: datetime
+    last_attempt: datetime | None = None
     scroll: int = 0
     last_error: str | None = None
     # Session-local card state: providers hidden with ``h`` (excluded from
@@ -369,7 +370,10 @@ def _card_lines(
         for window in snapshot.windows:
             lines.append(_window_line(window, glyphs, now, label_width, bar_width, compact))
         if snapshot.stale and snapshot.error is not None:
-            lines.append([Segment(f"  last update failed: {snapshot.error.message}", STYLE_WARN)])
+            detail = snapshot.error.message
+            if snapshot.error.action:
+                detail += f" {glyphs.dash} {snapshot.error.action}"
+            lines.append([Segment(f"  last update failed: {detail}", STYLE_WARN)])
         return lines
 
     message = _STATUS_MESSAGES.get(snapshot.status, _STATUS_MESSAGES[UNAVAILABLE])
@@ -395,7 +399,8 @@ def _header_text(view: TuiView, glyphs: Glyphs) -> str:
         if view.loading:
             parts.append(f"refreshing{glyphs.ellipsis}")
         elif view.refresh_seconds > 0:
-            next_at = view.last_refresh + timedelta(seconds=view.refresh_seconds)
+            attempt_at = view.last_attempt or view.last_refresh
+            next_at = attempt_at + timedelta(seconds=view.refresh_seconds)
             remaining = int((next_at - view.now).total_seconds())
             if remaining > 0:
                 minutes, seconds = divmod(remaining, 60)
@@ -493,7 +498,8 @@ def render(view: TuiView, width: int, height: int, glyphs: Glyphs = UNICODE_GLYP
         )
     elif view.snapshots is None:
         for provider_id in visible_ids:
-            status = [Segment(f"{glyphs.hollow} fetching{glyphs.ellipsis}", STYLE_DIM)]
+            state = f"fetching{glyphs.ellipsis}" if view.loading else "no data"
+            status = [Segment(f"{glyphs.hollow} {state}", STYLE_DIM)]
             focused = provider_id == view.focus
             if focused:
                 focus_row = len(content)
@@ -566,6 +572,7 @@ class AppController:
         self._future: Future | None = None
         self._refresh_ids: tuple[str, ...] = ()  # ids the in-flight refresh covers
         self._restore_pending = False  # `a` pressed while a refresh was in flight
+        self._deferred_refresh_ids: tuple[str, ...] | None = None
         self.snapshots: tuple[ProviderSnapshot, ...] | None = None
         self.loading = False
         self.last_refresh: datetime | None = None
@@ -645,7 +652,7 @@ class AppController:
             self._reveal_focus = self.focus is not None
         if not ids:
             return
-        if self._future is not None and not self._future.done():
+        if self._future is not None:
             self._restore_pending = True
             return
         self._submit(ids)
@@ -662,8 +669,12 @@ class AppController:
         ids = tuple(provider_ids)
         if not ids:
             return  # nothing rendered -> nothing to refresh
-        if self._future is not None and not self._future.done():
-            return  # suppress overlapping refreshes; the pending set wins
+        if self._future is not None:
+            if self._future.done():
+                # Preserve a keypress that lands after completion but before
+                # the curses loop has polled and adopted the result.
+                self._deferred_refresh_ids = ids
+            return
         self.loading = True
         self._refresh_ids = ids
         future: Future = Future()
@@ -695,6 +706,7 @@ class AppController:
         if self._future is not None and self._future.done():
             future, self._future = self._future, None
             covered, self._refresh_ids = self._refresh_ids, ()
+            deferred, self._deferred_refresh_ids = self._deferred_refresh_ids, None
             self.loading = False
             self.last_attempt = now
             try:
@@ -727,6 +739,8 @@ class AppController:
                 # A restore pressed while this refresh was in flight: its
                 # full refresh was deferred, not dropped — submit it now.
                 self._submit(self.visible_ids)
+            elif deferred is not None:
+                self._submit(deferred)
         if (
             not self.loading
             and self.refresh_seconds > 0
@@ -773,6 +787,7 @@ class AppController:
             refresh_seconds=self.refresh_seconds,
             version=__version__,
             now=now,
+            last_attempt=self.last_attempt,
             scroll=self.scroll,
             last_error=self.last_error,
             hidden=frozenset(self.hidden),
@@ -791,6 +806,8 @@ class AppController:
         daemon it cannot delay interpreter exit; see the class docstring.
         """
         self._future = None
+        self._deferred_refresh_ids = None
+        self._restore_pending = False
 
 
 def _terminal_codeset(stream=None) -> str | None:

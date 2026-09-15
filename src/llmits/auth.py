@@ -167,7 +167,7 @@ def secure_read_json(path: Path, what: str) -> dict:
     """Securely read a credential-bearing JSON object."""
     try:
         payload = json.loads(_secure_read_bytes(path, what).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise CredentialError(
             f"{what} is not valid JSON",
             "log in again with the official CLI to recreate the file",
@@ -184,7 +184,7 @@ def secure_read_toml(path: Path, what: str) -> dict:
     """Securely read a credential-bearing TOML document."""
     try:
         payload = tomllib.loads(_secure_read_bytes(path, what).decode("utf-8"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError):
         raise CredentialError(
             f"{what} is not valid TOML",
             "reconfigure the official tool to recreate the file",
@@ -418,7 +418,8 @@ def _kimi_key_from_cli_config(data: dict) -> str | None:
     for entry in providers.values():
         if not isinstance(entry, dict):
             continue
-        if entry.get("base_url") not in _KIMI_CODE_BASE_URLS:
+        base_url = entry.get("base_url")
+        if not isinstance(base_url, str) or base_url not in _KIMI_CODE_BASE_URLS:
             continue
         key = entry.get("api_key")
         if isinstance(key, str) and key.strip():
@@ -470,7 +471,10 @@ _ZAI_CODEX_BASE_URLS = frozenset(
 
 def _zai_key_from_claude_settings(data: dict) -> str | None:
     env = data.get("env")
-    if not isinstance(env, dict) or env.get("ANTHROPIC_BASE_URL") not in _ZAI_CLAUDE_BASE_URLS:
+    if not isinstance(env, dict):
+        return None
+    base_url = env.get("ANTHROPIC_BASE_URL")
+    if not isinstance(base_url, str) or base_url not in _ZAI_CLAUDE_BASE_URLS:
         return None
     token = env.get("ANTHROPIC_AUTH_TOKEN")
     return token if isinstance(token, str) else None
@@ -488,7 +492,10 @@ def _zai_key_from_codex_config(data: dict) -> str | None:
     if not isinstance(providers, dict):
         return None
     entry = providers.get("ZAI")
-    if not isinstance(entry, dict) or entry.get("base_url") not in _ZAI_CODEX_BASE_URLS:
+    if not isinstance(entry, dict):
+        return None
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or base_url not in _ZAI_CODEX_BASE_URLS:
         return None
     token = entry.get("experimental_bearer_token")
     return token if isinstance(token, str) else None

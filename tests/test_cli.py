@@ -6,11 +6,15 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from llmits import cli
+from tests import support
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SENTINEL = "cli-sentinel-token"
+# Invented token planted in a temporary Codex config; never a real credential.
+CODEX_ZAI_TOKEN = "zai-invented-token-0123456789abcdef"
 
 
 class Response:
@@ -52,16 +56,7 @@ def readers(token=SENTINEL):
 def isolated_home():
     tmp = tempfile.TemporaryDirectory()
     os.environ["HOME"] = tmp.name
-    for var in (
-        "LLMITS_CLAUDE_CREDENTIALS",
-        "LLMITS_CODEX_CREDENTIALS",
-        "CLAUDE_CONFIG_DIR",
-        "ZAI_API_KEY",
-        "ZHIPU_API_KEY",
-        "KIMI_API_KEY",
-        "KIMI_CODE_HOME",
-        "XDG_DATA_HOME",
-    ):
+    for var in support.CREDENTIAL_ENV_VARS:
         os.environ.pop(var, None)
     return tmp
 
@@ -171,6 +166,62 @@ class JsonModeTests(unittest.TestCase):
         self.assertIn("kimi-cli", actions)
         self.assertIn("OpenCode Go", actions)
 
+    def test_exported_codex_home_cannot_supply_a_zai_credential(self):
+        """A developer's exported CODEX_HOME must not satisfy ZAI discovery."""
+        original_env = dict(os.environ)
+        self.addCleanup(lambda: os.environ.clear() or os.environ.update(original_env))
+        sandbox = tempfile.TemporaryDirectory()
+        self.addCleanup(sandbox.cleanup)
+        codex_home = Path(sandbox.name) / "codex-home"
+        codex_home.mkdir()
+        config = codex_home / "config.toml"
+        config.write_text(
+            "[model_providers.ZAI]\n"
+            'base_url = "https://api.z.ai/api/v1"\n'
+            f'experimental_bearer_token = "{CODEX_ZAI_TOKEN}"\n'
+        )
+        os.chmod(config, 0o600)
+        empty_home = Path(sandbox.name) / "empty-home"
+        empty_home.mkdir()
+
+        # Liveness: an environment that honors CODEX_HOME really does discover
+        # the planted file, so the isolation assertions below cannot pass on an
+        # inert fixture.
+        with mock.patch.dict(os.environ):
+            os.environ.clear()
+            os.environ["HOME"] = str(empty_home)
+            os.environ["CODEX_HOME"] = str(codex_home)
+            self.assertEqual(cli._credential_reader_map(None, None)["zai"](), CODEX_ZAI_TOKEN)
+
+        # A developer shell that exports CODEX_HOME is this same poison.
+        os.environ["CODEX_HOME"] = str(codex_home)
+        tmp = isolated_home()
+        self.addCleanup(tmp.cleanup)
+
+        class RecordingTransport:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, host, path, headers):
+                self.calls.append((host, path, headers))
+                return Response(200, (FIXTURES / "zai_quota_full.json").read_bytes())
+
+        transport = RecordingTransport()
+        code, out, _ = self.run_json(["--json"], lambda: transport, None)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            {p["provider"]: p["status"] for p in json.loads(out)["providers"]},
+            {
+                "claude": "auth_required",
+                "codex": "auth_required",
+                "zai": "auth_required",
+                "kimi": "auth_required",
+                "opencode": "auth_required",
+            },
+        )
+        self.assertEqual(transport.calls, [])
+        self.assertNotIn(CODEX_ZAI_TOKEN, out)
+
     def test_ambiguous_kimi_environment_key_is_never_forwarded(self):
         original_env = dict(os.environ)
         tmp = isolated_home()
@@ -242,24 +293,12 @@ class TuiModeTests(unittest.TestCase):
 class SymlinkCredentialTests(unittest.TestCase):
     def test_symlink_credentials_yield_auth_required_json_with_exit_one(self):
         import os as _os
-        import tempfile as _tempfile
         from pathlib import Path as _Path
 
         original_env = dict(os.environ)
-        tmp = _tempfile.TemporaryDirectory()
+        tmp = isolated_home()
         self.addCleanup(tmp.cleanup)
         self.addCleanup(lambda: os.environ.clear() or os.environ.update(original_env))
-        os.environ["HOME"] = tmp.name
-        for var in (
-            "LLMITS_CLAUDE_CREDENTIALS",
-            "LLMITS_CODEX_CREDENTIALS",
-            "CLAUDE_CONFIG_DIR",
-            "ZAI_API_KEY",
-            "ZHIPU_API_KEY",
-            "KIMI_API_KEY",
-            "KIMI_CODE_HOME",
-        ):
-            os.environ.pop(var, None)
 
         real = _Path(tmp.name) / "real.json"
         real.write_text('{"claudeAiOauth": {"accessToken": "tok"}}')

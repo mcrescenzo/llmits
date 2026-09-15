@@ -1,15 +1,29 @@
 """Create and verify an isolated, deterministic public-history candidate.
 
-The source repository is read only. The candidate is a new one-commit Git
-repository containing the current tracked and non-ignored working tree, so
-converged but not-yet-committed release work is included while local caches,
-agent state, credentials, and build output remain excluded by .gitignore.
+The source repository is read only: its refs, remotes, and index are
+snapshotted before the build and compared after it, and a build that changes
+any of them fails. The candidate is a new one-commit Git repository containing
+the current tracked and non-ignored working tree, so converged but
+not-yet-committed release work is included while local caches, agent state,
+credentials, and build output remain excluded by .gitignore.
 
 The scanner half covers the complete ancestry of HEAD: every commit message,
 every historical path, and every unique reachable blob, including content
 deleted before HEAD. It uses read-only Git plumbing only, and findings name
 the rule and the object identity; matched secret content is never captured
 or printed.
+
+Every Git subprocess runs with the caller's repository-routing and
+configuration-injection variables removed, so an exported GIT_DIR or an
+inherited GIT_CONFIG_COUNT cannot redirect reads or writes away from the
+repository named by the explicit -C target. System and global Git
+configuration are disabled for the same reason, and the built-in default
+global excludes file is overridden explicitly because disabling configuration
+does not disable that built-in path. One consequence is deliberate:
+"non-ignored" means this repository's own ignore rules — its .gitignore files
+and .git/info/exclude — never a machine-local global excludes file or an
+injected core.excludesFile, so the manifest is a function of the repository's
+contents and its own ignore rules rather than of the machine's Git setup.
 """
 from __future__ import annotations
 
@@ -33,6 +47,43 @@ PUBLIC_EMAIL = "mcrescenzo@users.noreply.github.com"
 COMMIT_DATE = "2000-01-01T00:00:00Z"
 COMMIT_MESSAGE = "Initial public release candidate\n"
 
+# Inherited variables that outrank the -C target for repository discovery, the
+# work tree, the index, object storage, and the ref namespace. Git consults
+# them before -C, so inheriting one lets a caller's shell redirect plumbing
+# that writes (init, hash-object, update-index, update-ref) into another
+# repository. Ordinary process variables such as PATH are preserved.
+_GIT_ROUTING_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_SHALLOW_FILE",
+    "GIT_QUARANTINE_PATH",
+)
+
+# Environment-supplied configuration (`git -c`, and what Git passes to hooks)
+# is honored as if it were on the command line, so it outranks both -C and the
+# NOSYSTEM/GLOBAL settings below. A caller could otherwise re-enable a global
+# excludes file, or repoint core.worktree, without touching os.environ's
+# routing variables at all.
+_GIT_CONFIG_ENV_VARS = ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS")
+_GIT_CONFIG_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+# Deterministic identity and date for the candidate's single root commit only.
+_CANDIDATE_IDENTITY_ENV = {
+    "GIT_AUTHOR_NAME": PUBLIC_NAME,
+    "GIT_AUTHOR_EMAIL": PUBLIC_EMAIL,
+    "GIT_COMMITTER_NAME": PUBLIC_NAME,
+    "GIT_COMMITTER_EMAIL": PUBLIC_EMAIL,
+    "GIT_AUTHOR_DATE": COMMIT_DATE,
+    "GIT_COMMITTER_DATE": COMMIT_DATE,
+}
+
 
 @dataclass(frozen=True)
 class SourceFile:
@@ -47,6 +98,32 @@ class ScanFinding:
     location: str
 
 
+def _stripped_env_name(name: str) -> bool:
+    """True when a caller-supplied variable must not reach our Git subprocesses."""
+    return (
+        name in _GIT_ROUTING_ENV_VARS
+        or name in _GIT_CONFIG_ENV_VARS
+        or name.startswith(_GIT_CONFIG_ENV_PREFIXES)
+    )
+
+
+def _git_env(*, identity: bool = False) -> dict[str, str]:
+    """Build a subprocess environment that keeps Git on the -C target.
+
+    Routing and configuration-injection variables inherited from the caller are
+    dropped, and system and global configuration are ignored, so only the
+    explicit -C repository and this module's arguments decide what Git reads or
+    writes. ``identity`` adds the fixed author, committer, and date used for
+    the candidate commit.
+    """
+    env = {name: value for name, value in os.environ.items() if not _stripped_env_name(name)}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    if identity:
+        env.update(_CANDIDATE_IDENTITY_ENV)
+    return env
+
+
 def _git(repo: Path, *args: str, input_bytes: bytes | None = None, env=None) -> bytes:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -54,7 +131,7 @@ def _git(repo: Path, *args: str, input_bytes: bytes | None = None, env=None) -> 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
-        env=env,
+        env=_git_env() if env is None else env,
     )
     if result.returncode:
         detail = result.stderr.decode("utf-8", "replace").strip()
@@ -62,10 +139,12 @@ def _git(repo: Path, *args: str, input_bytes: bytes | None = None, env=None) -> 
     return result.stdout
 
 
-def _source_state(source: Path) -> tuple[bytes, bytes]:
+def _source_state(source: Path) -> tuple[bytes, bytes, bytes]:
+    """Snapshot what candidate generation must leave alone: refs, remotes, index."""
     refs = _git(source, "for-each-ref", "--format=%(refname)%00%(objectname)")
     remotes = _git(source, "remote", "-v")
-    return refs, remotes
+    index = _git(source, "ls-files", "--stage", "-z")
+    return refs, remotes, index
 
 
 def _tracked_modes(source: Path) -> dict[str, int]:
@@ -84,7 +163,22 @@ def _tracked_modes(source: Path) -> dict[str, int]:
 def source_manifest(source: Path = REPO_ROOT) -> tuple[SourceFile, ...]:
     source = source.resolve()
     tracked_modes = _tracked_modes(source)
-    output = _git(source, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    # Disabling system and global configuration does NOT disable Git's built-in
+    # default global excludes file ($XDG_CONFIG_HOME/git/ignore, else
+    # ~/.config/git/ignore), because that path is a built-in default rather
+    # than a configured value. Naming it explicitly keeps the manifest
+    # independent of the machine while the repository's own .gitignore files
+    # and .git/info/exclude still apply.
+    output = _git(
+        source,
+        "-c",
+        f"core.excludesFile={os.devnull}",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
     files: list[SourceFile] = []
     for raw_path in output.split(b"\0"):
         if not raw_path:
@@ -382,24 +476,8 @@ def scan_candidate(candidate: Path) -> list[ScanFinding]:
     return findings
 
 
-def _isolated_git_env() -> dict[str, str]:
-    env = dict(os.environ)
-    env.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_AUTHOR_NAME": PUBLIC_NAME,
-            "GIT_AUTHOR_EMAIL": PUBLIC_EMAIL,
-            "GIT_COMMITTER_NAME": PUBLIC_NAME,
-            "GIT_COMMITTER_EMAIL": PUBLIC_EMAIL,
-            "GIT_AUTHOR_DATE": COMMIT_DATE,
-            "GIT_COMMITTER_DATE": COMMIT_DATE,
-        }
-    )
-    return env
-
-
 def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]:
+    """Write a one-commit candidate outside ``source`` and verify both sides."""
     source = source.resolve()
     output = output.expanduser().resolve()
     try:
@@ -420,7 +498,7 @@ def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]
         target.write_bytes(item.data)
         target.chmod(item.mode & 0o777)
 
-    git_env = _isolated_git_env()
+    git_env = _git_env(identity=True)
     _git(
         output,
         "init",
@@ -465,7 +543,9 @@ def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]
         summary = ", ".join(f"{finding.rule} in {finding.location}" for finding in findings)
         raise RuntimeError(f"candidate scan failed: {summary}")
     if _source_state(source) != before:
-        raise RuntimeError("source repository refs or remotes changed during candidate generation")
+        raise RuntimeError(
+            "source repository refs, remotes, or index changed during candidate generation"
+        )
 
     license_entry = next(item for item in manifest if item.path == "LICENSE")
     return {
@@ -478,6 +558,7 @@ def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]
         "scan_findings": [],
         "source_refs_unchanged": True,
         "source_remotes_unchanged": True,
+        "source_index_unchanged": True,
         "candidate_remotes": [],
     }
 
@@ -515,14 +596,18 @@ def main(argv: list[str] | None = None) -> int:
         repo = args.repository if args.repository is not None else REPO_ROOT
         try:
             report = history_scan_report(repo)
-        except RuntimeError as error:
+        except (OSError, RuntimeError) as error:
             print(f"history scan failed: {error}", file=sys.stderr)
             return 2
         print(json.dumps(report, indent=2, sort_keys=True))
         return 1 if report["findings"] else 0
     if args.repository is not None:
         parser.error("--repository applies only to --scan-history")
-    report = build_candidate(args.output)
+    try:
+        report = build_candidate(args.output)
+    except (OSError, RuntimeError) as error:
+        print(f"public-history candidate failed: {error}", file=sys.stderr)
+        return 2
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

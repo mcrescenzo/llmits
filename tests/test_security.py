@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import unicodedata
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from llmits import json_output, tui
+from llmits import auth, json_output, tui
 from llmits.http import TransportError
 from llmits.models import (
     AVAILABLE,
@@ -115,6 +116,16 @@ FORBIDDEN_OS_OPEN_FLAGS = {
 }
 
 
+def credential_open_flags_are_exact(flags: int) -> bool:
+    expected = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    return flags == expected
+
+
 def source_files() -> list[Path]:
     return sorted(p for p in SRC.rglob("*.py"))
 
@@ -184,6 +195,20 @@ class CallTests(unittest.TestCase):
                     if WRITE_MODE_CHARS & set(mode.value):
                         offenders.append(f"{path.name}:{node.lineno} opens for writing")
         self.assertEqual(offenders, [])
+
+    def test_credential_open_flags_are_exactly_read_only(self):
+        self.assertTrue(credential_open_flags_are_exact(auth._OPEN_FLAGS))
+
+    def test_credential_open_flag_guard_detects_mutations(self):
+        self.assertFalse(credential_open_flags_are_exact(auth._OPEN_FLAGS | os.O_RDWR))
+        self.assertFalse(credential_open_flags_are_exact(auth._OPEN_FLAGS | os.O_CREAT))
+        for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+            flag = getattr(os, name, 0)
+            if flag:
+                with self.subTest(flag=name):
+                    self.assertFalse(
+                        credential_open_flags_are_exact(auth._OPEN_FLAGS & ~flag)
+                    )
 
     def test_os_open_flags_restricted_to_credential_read(self):
         offenders = []

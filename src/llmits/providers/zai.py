@@ -139,13 +139,18 @@ def parse_usage(payload: dict) -> tuple[str, tuple[QuotaWindow, ...]]:
         remaining = entry.get("remaining")
         used_value = limit_value = remaining_value = None
         percent_source = None
-        if isinstance(usage, (int, float)) and isinstance(current, (int, float)):
+        if (
+            isinstance(usage, (int, float))
+            and not isinstance(usage, bool)
+            and isinstance(current, (int, float))
+            and not isinstance(current, bool)
+        ):
             # bounded_int also rejects non-finite values (1e999) that would
             # otherwise raise OverflowError at int()/round().
             used_value, limit_value = bounded_int(current), bounded_int(usage)
             remaining_value = (
                 bounded_int(remaining)
-                if isinstance(remaining, (int, float))
+                if isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
                 else max(limit_value - used_value, 0)
             )
             if limit_value > 0:
@@ -153,7 +158,11 @@ def parse_usage(payload: dict) -> tuple[str, tuple[QuotaWindow, ...]]:
         reset_at = common.epoch_to_datetime(entry.get("nextResetTime"), millis=True)
         if percent_source is None:
             percentage = entry.get("percentage")
-            percent_source = percentage if isinstance(percentage, (int, float)) else 0
+            percent_source = (
+                percentage
+                if isinstance(percentage, (int, float)) and not isinstance(percentage, bool)
+                else 0
+            )
         window = QuotaWindow.from_percent(
             key=key,
             label=label,

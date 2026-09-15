@@ -62,10 +62,14 @@ def _windows_from_rate_limit(rate_limit, prefix: str, label: str) -> list[QuotaW
         if not isinstance(entry, dict):
             continue
         used = entry.get("used_percent")
-        if not isinstance(used, (int, float)):
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
             continue
         period = entry.get("limit_window_seconds")
-        period_int = bounded_int(period) if isinstance(period, (int, float)) else 0
+        period_int = (
+            bounded_int(period)
+            if isinstance(period, (int, float)) and not isinstance(period, bool)
+            else 0
+        )
         period_seconds = period_int if period_int > 0 else default_period
         base = _duration_label(period_seconds)
         key = f"{prefix}/{base}" if prefix else base
@@ -206,11 +210,6 @@ def fetch(token: str, transport, now: datetime | None = None) -> ProviderSnapsho
     payload = common.decode_json_object(ID, "Codex", response.body, now)
     if isinstance(payload, ProviderSnapshot):
         return payload
-    has_signal = any(
-        key in payload for key in ("plan_type", "rate_limit", "credits", "rate_limit_reset_credits")
-    )
-    if not has_signal:
-        return common.parse_error_snapshot(ID, "no usage data in Codex response", now)
     plan_name, windows = parse_usage(payload)
     if not windows:
         return common.parse_error_snapshot(ID, "no usage data in Codex response", now)

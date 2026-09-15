@@ -1,6 +1,7 @@
 """Deterministic and non-destructive public-history candidate generation."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -8,27 +9,123 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import public_history  # noqa: E402
 
+# Repository-routing and configuration-injection variables Git honors ahead of
+# `-C`. The tool must strip them from every subprocess because some of its
+# calls write, so a caller that exports one could otherwise re-init, stage
+# against, or re-configure another repository.
+#
+# The poison sets used below are derived from the production module so these
+# tests cannot drift from what the tool strips, and the pinned expectations are
+# asserted against the production constants so deleting an entry there cannot
+# silently weaken every assertion in this file.
+EXPECTED_ROUTING_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_SHALLOW_FILE",
+    "GIT_QUARANTINE_PATH",
+)
+EXPECTED_CONFIG_VARS = ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS")
+EXPECTED_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
-class PublicHistoryTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
+GIT_ROUTING_VARS = public_history._GIT_ROUTING_ENV_VARS
+# Git numbers injected configuration entries, and the number of entries is
+# unbounded, so several indices (including a large one) are poisoned.
+INJECTED_CONFIG_NAMES = EXPECTED_CONFIG_VARS + tuple(
+    f"{prefix}{index}"
+    for prefix in EXPECTED_CONFIG_PREFIXES
+    for index in ("0", "1", "17", "999999")
+)
 
-    @staticmethod
-    def git(repo: Path, *args: str) -> str:
+# Invented fixture names, so a developer's own ignore rules are unlikely to
+# collide with them.
+MACHINE_IGNORED = "machine-ignored.txt"
+REPO_IGNORED = "repo-ignored.txt"
+INFO_IGNORED = "info-ignored.txt"
+SOURCE_FILES = {
+    "LICENSE": b"MIT License\n",
+    "README.md": b"# Example\n",
+    MACHINE_IGNORED: b"machine-local notes\n",
+    ".gitignore": f"{REPO_IGNORED}\n".encode(),
+    REPO_IGNORED: b"repository-ignored notes\n",
+}
+
+
+def probe_env() -> dict[str, str]:
+    """Environment for this module's own Git probes, never for the tool.
+
+    Built from the production sanitizer, so a probe cannot read from or write
+    to a repository that the caller's exported ``GIT_DIR`` (or injected Git
+    configuration) redirected, and the module has one definition of what
+    "sanitized" means instead of one per test class.
+    """
+    return public_history._git_env(identity=True)
+
+
+class GitProbeMixin:
+    """Sanitized Git runner and repository factory for this module's own fixtures."""
+
+    root: Path
+
+    def git(self, repo: Path, *args: str) -> str:
         return subprocess.run(
             ["git", "-C", str(repo), *args],
             check=True,
             capture_output=True,
             text=True,
+            env=probe_env(),
         ).stdout
+
+    def init_repo(
+        self,
+        name: str,
+        files: dict[str, bytes],
+        *,
+        info_exclude: str | None = None,
+        track: tuple[str, ...] = ("-A",),
+    ) -> Path:
+        """Create a temporary repository under ``self.root`` and commit its files.
+
+        ``track`` is passed straight to ``git add``. A fixture that depends on a
+        file being *untracked* must name its tracked paths explicitly, because
+        the default ``-A`` also obeys whatever ignore rules the developer's own
+        machine happens to carry.
+        """
+        repo = self.root / name
+        repo.mkdir()
+        for relative, data in files.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        self.git(repo, "init", "--quiet")
+        if info_exclude is not None:
+            (repo / ".git" / "info" / "exclude").write_text(info_exclude)
+        self.git(repo, "add", *track)
+        self.git(repo, "commit", "--quiet", "-m", "initial")
+        return repo
+
+    def tree_names(self, repo: Path) -> list[str]:
+        return self.git(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+
+
+class PublicHistoryTests(GitProbeMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
 
     def test_two_candidates_from_same_tree_have_same_clean_root(self) -> None:
         source_before = public_history._source_state(REPO_ROOT)
@@ -90,8 +187,288 @@ class PublicHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "outside the source"):
             public_history.build_candidate(REPO_ROOT / "dist" / "candidate")
 
+    def test_candidate_os_error_is_one_line_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(
+            public_history,
+            "build_candidate",
+            side_effect=OSError("synthetic write failure"),
+        ):
+            with mock.patch.object(sys, "stderr", stderr):
+                status = public_history.main(["--output", str(self.root / "candidate")])
 
-class HistoryScanTests(unittest.TestCase):
+        self.assertEqual(status, 2)
+        self.assertEqual(stderr.getvalue().count("\n"), 1)
+        self.assertIn(
+            "public-history candidate failed: synthetic write failure",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_candidate_cli_failure_is_one_line_without_traceback(self) -> None:
+        existing = self.root / "existing"
+        existing.mkdir()
+        marker = existing / "keep.txt"
+        marker.write_text("untouched\n")
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "tools" / "public_history.py"),
+                "--output",
+                str(existing),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr.count("\n"), 1)
+        self.assertIn("public-history candidate failed: candidate output already exists", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertEqual(marker.read_text(), "untouched\n")
+
+
+class InheritedGitEnvironmentTests(GitProbeMixin, unittest.TestCase):
+    """An exported Git routing variable must not redirect the tool's plumbing.
+
+    Every Git call names its repository with `-C`, and the candidate calls
+    write, so inherited routing variables are a correctness and safety issue.
+    All repositories here are temporary; the tool's own assertions are what
+    must fail, never a maintainer's checkout.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_git_environment_strips_repository_routing_variables(self) -> None:
+        names = GIT_ROUTING_VARS + INJECTED_CONFIG_NAMES
+        poison = {name: str(self.root / "poison") for name in names}
+
+        with mock.patch.dict(os.environ, poison):
+            env = public_history._git_env()
+
+        # Compare key sets rather than asserting membership against `env`: a
+        # failing assertion would print the whole subprocess environment, and
+        # that environment is the developer's real shell.
+        self.assertEqual(set(names) & set(env), set())
+        # The module's own configuration overrides survive the strip.
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        # Identity is added only for candidate writes, so a plain environment
+        # passes the caller's own values through untouched.
+        for name in public_history._CANDIDATE_IDENTITY_ENV:
+            self.assertEqual(env.get(name), os.environ.get(name), name)
+
+    def test_candidate_git_environment_is_sanitized_too(self) -> None:
+        names = GIT_ROUTING_VARS + INJECTED_CONFIG_NAMES
+        poison = {name: str(self.root / "poison") for name in names}
+
+        with mock.patch.dict(os.environ, poison):
+            env = public_history._git_env(identity=True)
+
+        self.assertEqual(set(names) & set(env), set())
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_AUTHOR_NAME"], public_history.PUBLIC_NAME)
+        self.assertEqual(env["GIT_AUTHOR_EMAIL"], public_history.PUBLIC_EMAIL)
+        self.assertEqual(env["GIT_AUTHOR_DATE"], public_history.COMMIT_DATE)
+        self.assertEqual(env["GIT_COMMITTER_DATE"], public_history.COMMIT_DATE)
+
+    def test_candidate_generation_ignores_an_exported_git_dir(self) -> None:
+        source = self.init_repo(
+            "source", {"LICENSE": b"MIT License\n", "README.md": b"# Example\n"}
+        )
+        decoy = self.init_repo("decoy", {"decoy.txt": b"decoy content\n"})
+        source_state = public_history._source_state(source)
+        decoy_state = public_history._source_state(decoy)
+        candidate = self.root / "candidate"
+
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(decoy / ".git")}):
+            report = public_history.build_candidate(candidate, source)
+
+        self.assertEqual(public_history._source_state(source), source_state)
+        self.assertEqual(public_history._source_state(decoy), decoy_state)
+        self.assertEqual(self.git(decoy, "status", "--porcelain"), "")
+        self.assertTrue((candidate / ".git").is_dir())
+        self.assertEqual(
+            self.git(candidate, "ls-tree", "-r", "--name-only", "HEAD").splitlines(),
+            ["LICENSE", "README.md"],
+        )
+        self.assertEqual(Path(report["candidate"]).resolve(), candidate.resolve())
+        self.assertEqual(report["scan_findings"], [])
+
+    def test_source_state_notices_an_index_change(self) -> None:
+        source = self.init_repo("source", {"LICENSE": b"MIT License\n"})
+        before = public_history._source_state(source)
+
+        (source / "staged.txt").write_bytes(b"staged content\n")
+        self.git(source, "update-index", "--add", "staged.txt")
+
+        self.assertNotEqual(public_history._source_state(source), before)
+
+    def test_candidate_report_confirms_the_source_index_is_unchanged(self) -> None:
+        source = self.init_repo("source", {"LICENSE": b"MIT License\n"})
+        before = public_history._source_state(source)
+
+        report = public_history.build_candidate(self.root / "candidate", source)
+
+        self.assertIs(report["source_index_unchanged"], True)
+        self.assertEqual(public_history._source_state(source), before)
+
+    def test_history_scan_stays_on_the_requested_repository(self) -> None:
+        token = "sk-" + "routingprobe01234"
+        target = self.init_repo("target", {"notes.txt": f"api_key={token}\n".encode()})
+        decoy = self.init_repo("decoy", {"decoy.txt": b"ordinary content\n"})
+        env = dict(os.environ)
+        env["GIT_DIR"] = str(decoy / ".git")
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "tools" / "public_history.py"),
+                "--scan-history",
+                "--repository",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertIn("high-confidence access token", completed.stdout)
+        self.assertNotIn(token, completed.stdout)
+        self.assertEqual(self.git(decoy, "status", "--porcelain"), "")
+
+
+class SanitizerSpecTests(unittest.TestCase):
+    """The production strip set is the contract these tests poison, so pin it."""
+
+    def test_production_sanitizer_matches_the_pinned_expectation(self) -> None:
+        missing = set(EXPECTED_ROUTING_VARS) - set(public_history._GIT_ROUTING_ENV_VARS)
+        self.assertEqual(missing, set(), "production stopped stripping a routing variable")
+        self.assertEqual(tuple(public_history._GIT_CONFIG_ENV_VARS), EXPECTED_CONFIG_VARS)
+        self.assertEqual(tuple(public_history._GIT_CONFIG_ENV_PREFIXES), EXPECTED_CONFIG_PREFIXES)
+
+    def test_stripped_name_predicate_covers_dynamic_and_preserved_names(self) -> None:
+        for name in GIT_ROUTING_VARS + INJECTED_CONFIG_NAMES:
+            self.assertTrue(public_history._stripped_env_name(name), name)
+        for name in ("PATH", "HOME", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_AUTHOR_NAME"):
+            self.assertFalse(public_history._stripped_env_name(name), name)
+
+
+class CandidateIgnoreRuleTests(GitProbeMixin, unittest.TestCase):
+    """The candidate's file set must follow repository-owned ignore rules only.
+
+    Everything here is invented data in temporary repositories; the real
+    checkout is never a fixture.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    @staticmethod
+    def machine_home(root: Path) -> Path:
+        """A temporary HOME whose built-in global excludes file hides a fixture."""
+        home = root / "machine-home"
+        (home / "git").mkdir(parents=True)
+        (home / "git" / "ignore").write_text(f"{MACHINE_IGNORED}\n")
+        return home
+
+    # ``-f`` keeps the fixture's tracked set independent of the developer's own
+    # ignore rules; the files whose exclusion is under test stay untracked.
+    TRACKED_FILES = ("-f", "LICENSE", "README.md", ".gitignore")
+
+    def test_machine_level_ignores_never_change_the_candidate(self) -> None:
+        source = self.init_repo("source", dict(SOURCE_FILES), track=self.TRACKED_FILES)
+        reference_path = self.root / "reference"
+        reference = public_history.build_candidate(reference_path, source)
+        reference_names = self.tree_names(reference_path)
+        # Fixture preconditions: the file a machine-level ignore hides must be
+        # untracked, or no exclude rule could ever apply to it, and the
+        # repository's own ignore file must already be in effect.
+        self.assertIn(MACHINE_IGNORED, reference_names)
+        self.assertNotIn(REPO_IGNORED, reference_names)
+        home = self.machine_home(self.root)
+
+        poisoned = (
+            # Git's built-in default global excludes file: disabling system and
+            # global configuration does not disable that built-in path.
+            {"HOME": str(home), "XDG_CONFIG_HOME": str(home)},
+            # Configuration injected through the environment, as a git hook or
+            # an embedding process does.
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.excludesFile",
+                "GIT_CONFIG_VALUE_0": str(home / "git" / "ignore"),
+            },
+            {"GIT_CONFIG_PARAMETERS": f"'core.excludesFile={home / 'git' / 'ignore'}'"},
+        )
+        for index, poison in enumerate(poisoned):
+            with self.subTest(poison=index), mock.patch.dict(os.environ, poison):
+                output = self.root / f"poisoned-{index}"
+                report = public_history.build_candidate(output, source)
+                self.assertEqual(report["commit"], reference["commit"], poison)
+                self.assertEqual(self.tree_names(output), reference_names, poison)
+
+    def test_repository_owned_ignore_rules_still_apply(self) -> None:
+        source = self.init_repo(
+            "source",
+            dict(SOURCE_FILES),
+            info_exclude=f"{INFO_IGNORED}\n",
+            track=self.TRACKED_FILES,
+        )
+        (source / INFO_IGNORED).write_bytes(b"repository-local exclude notes\n")
+        output = self.root / "candidate"
+
+        public_history.build_candidate(output, source)
+
+        names = self.tree_names(output)
+        self.assertIn("LICENSE", names)
+        self.assertNotIn(REPO_IGNORED, names, ".gitignore stopped applying")
+        self.assertNotIn(INFO_IGNORED, names, ".git/info/exclude stopped applying")
+
+
+class ProbeHelperIsolationTests(GitProbeMixin, unittest.TestCase):
+    """This module's own temporary Git operations must stay on their repository."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_module_probe_helpers_ignore_a_redirected_git_environment(self) -> None:
+        decoy = self.root / "decoy"
+        decoy.mkdir()
+        poison = {
+            "GIT_DIR": str(decoy / ".git"),
+            "GIT_WORK_TREE": str(decoy),
+            "GIT_INDEX_FILE": str(decoy / "index"),
+            "GIT_OBJECT_DIRECTORY": str(decoy / "objects"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": str(decoy),
+            "GIT_CONFIG_PARAMETERS": f"'core.worktree={decoy}'",
+        }
+
+        with mock.patch.dict(os.environ, poison):
+            repo = self.init_repo("probe", {"LICENSE": b"MIT License\n"})
+            head = self.git(repo, "rev-parse", "HEAD").strip()
+            status = self.git(repo, "status", "--porcelain")
+
+        self.assertEqual(list(decoy.iterdir()), [], "a probe wrote into the redirected repository")
+        self.assertEqual(status, "")
+        self.assertEqual(len(head), 40)
+        self.assertEqual(self.tree_names(repo), ["LICENSE"])
+
+
+class HistoryScanTests(GitProbeMixin, unittest.TestCase):
     """Full-ancestry scanner coverage, including content deleted before HEAD."""
 
     def setUp(self) -> None:
@@ -101,33 +478,6 @@ class HistoryScanTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git(self.repo, "init", "--quiet")
-
-    @staticmethod
-    def _env() -> dict[str, str]:
-        env = dict(os.environ)
-        env.update(
-            {
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_AUTHOR_NAME": "Test Committer",
-                "GIT_AUTHOR_EMAIL": "committer@example.test",
-                "GIT_COMMITTER_NAME": "Test Committer",
-                "GIT_COMMITTER_EMAIL": "committer@example.test",
-                "GIT_AUTHOR_DATE": "2001-02-03T04:05:06+00:00",
-                "GIT_COMMITTER_DATE": "2001-02-03T04:05:06+00:00",
-            }
-        )
-        return env
-
-    @classmethod
-    def git(cls, repo: Path, *args: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(repo), *args],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=cls._env(),
-        ).stdout
 
     def write(self, relative: str, data: bytes) -> None:
         target = self.repo / relative

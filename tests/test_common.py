@@ -35,6 +35,15 @@ class TestEpochToDatetime(unittest.TestCase):
         self.assertIsNone(common.epoch_to_datetime("1784502400"))
         self.assertIsNone(common.epoch_to_datetime([1784502400]))
 
+    def test_boolean_is_not_an_epoch(self):
+        self.assertIsNone(common.epoch_to_datetime(True))
+        self.assertIsNone(common.epoch_to_datetime(True, millis=True))
+
+    def test_oversized_integer_is_none_not_raise(self):
+        oversized = 10**310
+        self.assertIsNone(common.epoch_to_datetime(oversized))
+        self.assertIsNone(common.epoch_to_datetime(oversized, millis=True))
+
     def test_valid_epoch_seconds(self):
         result = common.epoch_to_datetime(1784502400)
         self.assertEqual(result, datetime(2026, 7, 19, 23, 6, 40, tzinfo=timezone.utc))
@@ -131,6 +140,13 @@ class TestRetryAfterText(unittest.TestCase):
     def test_non_digit_is_empty(self):
         self.assertEqual(common._retry_after_text("soon"), "")
 
+    def test_non_ascii_digits_are_empty(self):
+        self.assertEqual(common._retry_after_text("²"), "")
+        self.assertEqual(common._retry_after_text("٣"), "")
+
+    def test_pathologically_long_digits_are_empty(self):
+        self.assertEqual(common._retry_after_text("9" * 4301), "")
+
     def test_http_date_value_is_empty(self):
         # RFC 7231 also allows an HTTP-date for Retry-After; this adapter
         # only understands the delta-seconds form and silently drops the rest.
@@ -187,6 +203,15 @@ class TestStatusErrorSnapshot(unittest.TestCase):
         )
         self.assertEqual(snapshot.status, RATE_LIMITED)
         self.assertEqual(snapshot.error.message, "rate limited; retry in 30s")
+
+    def test_429_with_invalid_digit_text_stays_rate_limited(self):
+        for value in ("²", "9" * 4301):
+            with self.subTest(value_length=len(value)):
+                snapshot = common.status_error_snapshot(
+                    "zai", 429, {"retry-after": value}, self._now(), "relog"
+                )
+                self.assertEqual(snapshot.status, RATE_LIMITED)
+                self.assertEqual(snapshot.error.message, "rate limited")
 
     def test_500_maps_to_network_error(self):
         snapshot = common.status_error_snapshot("claude", 500, {}, self._now(), "relog")

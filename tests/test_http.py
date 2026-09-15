@@ -24,17 +24,31 @@ class FakeResponse:
         return self._chunks.pop(0)
 
 
+class FakeSocket:
+    def __init__(self):
+        self.timeouts = []
+        self.socket_options = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def setsockopt(self, level, option, value):
+        self.socket_options.append((level, option, value))
+
+
 class FakeConnection:
     script: list = []
     last_instance = None
 
-    def __init__(self, host, port=None, timeout=None, context=None):
+    def __init__(self, host, port=None, timeout=None, context=None, deadline=None):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.context = context
+        self.deadline = deadline
         self.requests = []
         self.closed = False
+        self.sock = FakeSocket()
         type(self).last_instance = self
 
     def request(self, method, path, headers=None, **kwargs):
@@ -60,12 +74,12 @@ class TransportHarness(unittest.TestCase):
             self.contexts.append(context)
             return context
 
-        self.transport = ll_http.HttpTransport(ssl_context_factory=factory)
+        self.transport = ll_http.HttpTransport(
+            ssl_context_factory=factory,
+            connection_factory=FakeConnection,
+        )
         FakeConnection.script = []
         FakeConnection.last_instance = None
-        patcher = mock.patch.object(http.client, "HTTPSConnection", FakeConnection)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
 
 class AllowlistTests(TransportHarness):
@@ -82,6 +96,10 @@ class AllowlistTests(TransportHarness):
 
 
 class ConnectionTests(TransportHarness):
+    def test_default_transport_uses_deadline_aware_connection(self):
+        transport = ll_http.HttpTransport()
+        self.assertIs(transport._connection_factory, ll_http._DeadlineHTTPSConnection)
+
     def test_connection_gets_fixed_port_timeout_and_verified_context(self):
         FakeConnection.script = [FakeResponse(200, [], [b"{}"])]
         self.transport.get("chatgpt.com", "/backend-api/wham/usage", {"A": "b"})
@@ -89,6 +107,39 @@ class ConnectionTests(TransportHarness):
         self.assertEqual((conn.host, conn.port), ("chatgpt.com", 443))
         self.assertEqual(conn.timeout, 10.0)
         self.assertIsInstance(conn.context, ssl.SSLContext)
+
+    def test_tcp_tls_and_request_io_share_the_remaining_deadline(self):
+        raw_socket = FakeSocket()
+
+        class FakeContext:
+            verify_mode = ssl.CERT_REQUIRED
+            check_hostname = True
+
+            def wrap_socket(self, sock, server_hostname):
+                self.server_hostname = server_hostname
+                return sock
+
+        context = FakeContext()
+        connection = ll_http._DeadlineHTTPSConnection(
+            "chatgpt.com",
+            443,
+            timeout=10.0,
+            context=context,
+            deadline=10.0,
+        )
+        connect_timeouts = []
+
+        def create_connection(address, timeout, source_address):
+            connect_timeouts.append(timeout)
+            return raw_socket
+
+        connection._create_connection = create_connection
+        with mock.patch.object(ll_http.time, "monotonic", side_effect=[1.0, 4.0, 7.0]):
+            connection.connect()
+
+        self.assertEqual(connect_timeouts, [9.0])
+        self.assertEqual(raw_socket.timeouts, [6.0, 3.0])
+        self.assertEqual(context.server_hostname, "chatgpt.com")
 
     def test_get_forwards_method_path_and_headers(self):
         FakeConnection.script = [FakeResponse(200, [], [b"ok"])]
@@ -120,7 +171,7 @@ class DefaultTlsContextTests(TransportHarness):
             sentinel = Path(tmp) / "keylog.txt"
             with mock.patch.dict(os.environ, {"SSLKEYLOGFILE": str(sentinel)}):
                 context = ll_http.create_tls_context()
-                transport = ll_http.HttpTransport()
+                transport = ll_http.HttpTransport(connection_factory=FakeConnection)
                 FakeConnection.script = [FakeResponse(200, [], [b"{}"])]
                 transport.get("chatgpt.com", "/p", {})
             # No key-log file is created (or written) at the sentinel path.
@@ -136,7 +187,7 @@ class DefaultTlsContextTests(TransportHarness):
         # Guard the seam itself: the transport default must remain the
         # hardened factory, never ssl.create_default_context.
         with mock.patch.object(ssl, "create_default_context") as ambient_factory:
-            transport = ll_http.HttpTransport()
+            transport = ll_http.HttpTransport(connection_factory=FakeConnection)
             FakeConnection.script = [FakeResponse(200, [], [b"{}"])]
             transport.get("chatgpt.com", "/p", {})
         ambient_factory.assert_not_called()
@@ -272,6 +323,20 @@ class ResponseTests(TransportHarness):
         with self.assertRaises(ll_http.ResponseTooLarge):
             self.transport.get("api.z.ai", "/p", {})
         self.assertTrue(FakeConnection.last_instance.closed)
+
+    def test_trickling_body_cannot_exceed_total_request_deadline(self):
+        FakeConnection.script = [FakeResponse(200, [], [b"a", b"b"])]
+        with mock.patch.object(
+            ll_http.time,
+            "monotonic",
+            side_effect=[0.0, 2.0, 9.0, 10.1],
+        ):
+            with self.assertRaises(ll_http.RequestDeadlineExceeded):
+                self.transport.get("api.z.ai", "/p", {})
+
+        connection = FakeConnection.last_instance
+        self.assertEqual(connection.sock.timeouts, [8.0, 1.0])
+        self.assertTrue(connection.closed)
 
     def test_connection_refused_becomes_safe_transport_error(self):
         FakeConnection.script = [ConnectionRefusedError()]
