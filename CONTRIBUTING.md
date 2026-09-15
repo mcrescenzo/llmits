@@ -87,7 +87,7 @@ Maintainers can create a clean, one-commit publication input from the current co
 make public-history OUTPUT=/tmp/llmits-public-history
 ```
 
-`OUTPUT` must name a new directory outside the source repository. The command includes tracked and non-ignored working-tree files, omits ignored local state, uses the repository owner's GitHub no-reply identity, scans the candidate commit and blobs, and prints a machine-readable verification report. Two runs from the same tree must print the same candidate commit ID. The command does not push, publish, tag, change visibility, or authorize release.
+`OUTPUT` must name a new directory outside the source repository. The command includes tracked and non-ignored working-tree files, omits ignored local state, uses the repository owner's GitHub no-reply identity, scans the candidate commit and blobs, and prints a machine-readable verification report. Two runs from the same tree must print the same candidate commit ID. The source repository's refs, remotes, and index are left unchanged, even when the calling environment exports repository-routing variables such as `GIT_DIR` or injects Git configuration through `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`. The candidate's file set follows the repository's own ignore rules (`.gitignore` files and `.git/info/exclude`) only: a machine-local global excludes file is overridden explicitly, including Git's built-in default at `$XDG_CONFIG_HOME/git/ignore`, so candidate contents do not depend on the machine's Git configuration. The command does not push, publish, tag, change visibility, or authorize release.
 
 ## Reporting security issues
 

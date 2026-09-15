@@ -8,27 +8,16 @@ from unittest import mock
 from llmits import auth
 from llmits.models import AUTH_REQUIRED
 from llmits.providers import FETCHERS, PROVIDER_IDS
+from tests import support
 
 SENTINEL = "sk-sentinel-token-0123456789abcdef"
 # Planted in files that discovery must skip; returning it means a guard failed.
 DECOY = "decoy-key-that-must-never-be-returned"
 
 # Every variable any credential source consults, cleared for each test so the
-# developer's real environment can neither satisfy nor break discovery.
-ISOLATED_ENV_VARS = (
-    "LLMITS_CLAUDE_CREDENTIALS",
-    "LLMITS_CODEX_CREDENTIALS",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "ZAI_API_KEY",
-    "ZHIPU_API_KEY",
-    "KIMI_API_KEY",
-    "KIMI_CODE_HOME",
-    "XDG_DATA_HOME",
-    "OPENCODE_AUTH_CONTENT",
-    "FIRST_TEST_KEY",
-    "SECOND_TEST_KEY",
-)
+# developer's real environment can neither satisfy nor break discovery, plus
+# the synthetic keys these tests register their own sources under.
+ISOLATED_ENV_VARS = support.CREDENTIAL_ENV_VARS + ("FIRST_TEST_KEY", "SECOND_TEST_KEY")
 
 
 def write_file(tmpdir: Path, name: str, text: str, mode: int = 0o600) -> Path:
@@ -444,6 +433,43 @@ class ZaiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
         write_file(self.tmp, ".codex/config.toml", self.bound_codex_config(SENTINEL))
         self.assertEqual(auth.read_zai_key(), SENTINEL)
 
+    def test_non_string_tool_base_urls_are_skipped(self):
+        self.assertIsNone(
+            auth._zai_key_from_claude_settings(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": ["https://api.z.ai/api/anthropic"],
+                        "ANTHROPIC_AUTH_TOKEN": DECOY,
+                    }
+                }
+            )
+        )
+        self.assertIsNone(
+            auth._zai_key_from_codex_config(
+                {
+                    "model_providers": {
+                        "ZAI": {
+                            "base_url": ["https://api.z.ai/api/v1"],
+                            "experimental_bearer_token": DECOY,
+                        }
+                    }
+                }
+            )
+        )
+
+        make_creds(
+            self.tmp,
+            ".claude/settings.json",
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": ["https://api.z.ai/api/anthropic"],
+                    "ANTHROPIC_AUTH_TOKEN": DECOY,
+                }
+            },
+        )
+        write_file(self.tmp, ".codex/config.toml", self.bound_codex_config(SENTINEL))
+        self.assertEqual(auth.read_zai_key(), SENTINEL)
+
     def test_refuses_tool_keys_not_bound_to_api_zai(self):
         make_creds(
             self.tmp,
@@ -711,6 +737,28 @@ class KimiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
         os.environ["KIMI_CODE_HOME"] = str(custom)
         write_file(custom, "config.toml", self.bound_cli_config(SENTINEL))
         self.assertEqual(auth.read_kimi_key(), SENTINEL)
+
+    def test_non_string_cli_base_url_is_skipped(self):
+        payload = {
+            "providers": {
+                "kimi-code": {
+                    "base_url": ["https://api.kimi.com/coding/v1"],
+                    "api_key": DECOY,
+                }
+            }
+        }
+        self.assertIsNone(auth._kimi_key_from_cli_config(payload))
+
+        write_file(
+            self.tmp,
+            ".kimi-code/config.toml",
+            '[providers.kimi-code]\nbase_url = ["https://api.kimi.com/coding/v1"]\n'
+            f'api_key = "{DECOY}"\n',
+        )
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_kimi_key()
+        self.assertIn("Kimi Coding Plan key not set", ctx.exception.error.message)
+        self.assertNotIn(DECOY, ctx.exception.error.message + ctx.exception.error.action)
 
     def test_refuses_cli_config_keys_not_bound_to_the_coding_base_url(self):
         # A pay-as-you-go Moonshot entry (or any other base) must never be

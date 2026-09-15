@@ -185,6 +185,34 @@ class ZaiParseTests(unittest.TestCase):
         self.assertNotEqual(windows[0].key, "credits")
         self.assertEqual(windows[0].key, "credits_other")
 
+    def test_boolean_quota_numbers_are_treated_as_missing(self):
+        base = {"type": "5h Token", "rawType": "TOKENS_LIMIT", "unit": 3}
+
+        _, (counts,) = zai.parse_usage(
+            {"data": {"limits": [{**base, "usage": True, "currentValue": True}]}}
+        )
+        self.assertEqual(counts.used_percent, 0)
+        self.assertEqual(
+            (counts.used_value, counts.limit_value, counts.remaining_value),
+            (None, None, None),
+        )
+
+        _, (percentage,) = zai.parse_usage(
+            {"data": {"limits": [{**base, "percentage": True}]}}
+        )
+        self.assertEqual(percentage.used_percent, 0)
+
+        _, (remaining,) = zai.parse_usage(
+            {
+                "data": {
+                    "limits": [
+                        {**base, "usage": 10, "currentValue": 2, "remaining": True}
+                    ]
+                }
+            }
+        )
+        self.assertEqual(remaining.remaining_value, 8)
+
 
 class ZaiFetchTests(unittest.TestCase):
     def test_out_of_range_reset_time_keeps_snapshot_available(self):

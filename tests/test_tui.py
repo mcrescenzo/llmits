@@ -74,6 +74,7 @@ def view(
     ids=("claude", "codex", "zai"),
     scroll=0,
     now=NOW,
+    last_attempt=None,
     version="0.2.0",
     last_error=None,
     hidden=frozenset(),
@@ -89,6 +90,7 @@ def view(
         refresh_seconds=refresh_seconds,
         version=version,
         now=now,
+        last_attempt=last_attempt,
         scroll=scroll,
         last_error=last_error,
         hidden=hidden,
@@ -226,6 +228,23 @@ class RenderTests(unittest.TestCase):
         )
         self.assertEqual(header, "llmits v0.2.0  ·  updated 12s ago  ·  next refresh 4:48")
 
+    def test_header_countdown_uses_last_attempt_after_failed_refresh(self):
+        last_success = NOW - timedelta(minutes=10)
+        last_attempt = NOW - timedelta(seconds=12)
+        header = tui._header_text(
+            view(
+                loading=False,
+                last_refresh=last_success,
+                last_attempt=last_attempt,
+                refresh_seconds=300,
+            ),
+            tui.UNICODE_GLYPHS,
+        )
+        self.assertEqual(
+            header,
+            "llmits v0.2.0  ·  updated 10m ago  ·  next refresh 4:48",
+        )
+
     def test_header_refresh_in_flight_with_data(self):
         last = NOW - timedelta(seconds=12)
         header = tui._header_text(
@@ -292,6 +311,25 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(last_line[0].style, tui.STYLE_DIM)
         self.assertIn("q/esc quit", last_line[0].text)
 
+    def test_readme_sample_matches_fixture_at_80_columns(self):
+        marker = "Sample render at 80 columns, from the test fixtures"
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+        documented = readme.split(marker, 1)[1].split("```", 2)[1].strip("\n").splitlines()
+        sample_view = view(
+            four_card_fixture()[:3],
+            loading=False,
+            last_refresh=NOW - timedelta(seconds=12),
+            refresh_seconds=300,
+            ids=("claude", "codex", "zai"),
+            version=PACKAGE_VERSION,
+            focus="claude",
+        )
+        rendered = text(tui.render(sample_view, 80, 24).lines)
+        self.assertEqual(documented, rendered[:17] + [rendered[-1]])
+        self.assertTrue(all(len(line) <= 79 for line in documented))
+
     def test_footer_lists_both_q_and_esc_as_quit_keys(self):
         # rank 90: a monochrome or screen-reader-piped terminal must still
         # learn both quit keys from the footer text itself.
@@ -357,6 +395,16 @@ class RenderTests(unittest.TestCase):
         loading_line = next(line for line in frame.lines if "fetching" in "".join(s.text for s in line))
         fetching_segment = next(s for s in loading_line if "fetching" in s.text)
         self.assertEqual(fetching_segment.style, tui.STYLE_DIM)
+
+    def test_idle_without_snapshots_does_not_claim_fetching(self):
+        frame = tui.render(
+            view(None, loading=False, last_refresh=None, ids=("claude",)),
+            120,
+            40,
+        )
+        flattened = flat(frame)
+        self.assertIn("○ no data", flattened)
+        self.assertNotIn("fetching", flattened)
 
     def test_card_name_is_accent_styled(self):
         frame = tui.render(view((snapshot(windows=(full_window(10),)),)), 120, 40)
@@ -477,6 +525,22 @@ class RenderTests(unittest.TestCase):
         self.assertIn("stale", flattened)
         self.assertIn("30%", flattened)
         self.assertIn("last update failed: provider server error (HTTP 500)", flattened)
+
+    def test_stale_card_shows_recovery_action(self):
+        stale = replace(
+            snapshot(windows=(full_window(30),)),
+            stale=True,
+            error=ProviderError(
+                code=AUTH_REQUIRED,
+                message="credentials rejected",
+                action="run claude login",
+            ),
+        )
+        rendered = flat(tui.render(view((stale,)), 120, 40))
+        self.assertIn(
+            "last update failed: credentials rejected — run claude login",
+            rendered,
+        )
 
     def test_stale_card_without_error_has_no_failure_line(self):
         stale = replace(snapshot(windows=(full_window(30),)), stale=True, error=None)
@@ -1272,6 +1336,51 @@ class FocusToolkitControllerTests(unittest.TestCase):
             ]
             self.assertEqual(len(marked), 1)
             self.assertIn("Z.AI", marked[0])
+        finally:
+            controller.close()
+
+    def test_refresh_key_after_future_resolves_is_deferred_until_poll(self):
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("R"))
+            svc._gate.set()
+            self.settle(controller)  # done, but not yet adopted by poll
+
+            controller.handle_key(ord("R"))
+            self.assertEqual(svc.calls, 2)
+            self.assertEqual(controller._deferred_refresh_ids, ("claude",))
+
+            controller.poll(NOW)
+            self.assertEqual(svc.calls, 3)
+            self.assertEqual(svc.requested[-1], ("claude",))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+        finally:
+            controller.close()
+
+    def test_a_after_future_resolves_defers_until_poll_adopts_result(self):
+        controller, svc = self._settled_controller()
+        try:
+            controller.handle_key(ord("h"))  # hide claude
+            controller.handle_key(ord("r"))  # refresh codex + zai
+            svc._gate.set()
+            self.settle(controller)  # result is done, but poll has not adopted it
+
+            controller.handle_key(ord("a"))
+            self.assertEqual(svc.calls, 2)
+            self.assertTrue(controller._restore_pending)
+
+            controller.poll(NOW)
+            self.assertEqual(svc.calls, 3)
+            self.assertEqual(svc.requested[-1], ("claude", "codex", "zai"))
+            svc._gate.set()
+            self.settle(controller)
+            controller.poll(NOW)
+            self.assertEqual(
+                [snapshot.provider for snapshot in controller.snapshots],
+                ["claude", "codex", "zai"],
+            )
         finally:
             controller.close()
 

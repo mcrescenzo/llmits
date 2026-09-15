@@ -112,13 +112,13 @@ def _finite_number(value) -> float | None:
     """Coerce ``value`` to a finite float, or None.
 
     Shared preamble for ``bounded_percent`` and ``bounded_int``: both reject
-    the same inputs (non-numeric, and numeric-but-non-finite like NaN or a
-    JSON ``1e999``) the same way before diverging on how they clamp the
-    result.
+    the same inputs (non-numeric, numeric-but-non-finite like NaN or a JSON
+    ``1e999``, and integers outside the float range) before diverging on how
+    they clamp the result.
     """
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 

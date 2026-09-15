@@ -117,6 +117,12 @@ class RefreshService:
                 message="no credential reader configured",
                 action="this is an internal llmits error; please report it",
             )
+        except Exception as exc:  # defensive: credential discovery must not kill the app
+            error = ProviderError(
+                code=AUTH_REQUIRED,
+                message=f"credential discovery failed ({type(exc).__name__})",
+                action="report this internal llmits credential error",
+            )
         else:
             error = None
         if error is not None:

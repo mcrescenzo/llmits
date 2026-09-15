@@ -173,6 +173,11 @@ class TestSanitizationHardening(unittest.TestCase):
         self.assertEqual(models.bounded_int(42.6), 43)
         self.assertEqual(models.bounded_int(-5), 0)
 
+    def test_oversized_integer_provider_values_become_zero(self):
+        oversized = 10**310
+        self.assertEqual(models.bounded_percent(oversized), 0)
+        self.assertEqual(models.bounded_int(oversized), 0)
+
     def test_snapshot_sanitizes_and_bounds_plan_name(self):
         from datetime import datetime, timezone
 

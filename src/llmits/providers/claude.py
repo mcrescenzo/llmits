@@ -38,11 +38,11 @@ def _parse_rfc3339(value) -> datetime | None:
     try:
         # Python 3.11+ parses a trailing 'Z' UTC designator natively.
         parsed = datetime.fromisoformat(value)
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _slugify(name: str) -> str:
@@ -81,15 +81,20 @@ def _model_label(name: str, slug: str) -> str:
 
 
 def _is_finite_number(value) -> TypeGuard[float]:
-    """Narrow ``value`` to a finite number for both runtime and mypy."""
-    return isinstance(value, (int, float)) and math.isfinite(value)
+    """Narrow ``value`` to a finite non-boolean number for runtime and mypy."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _window_from_rate_limit(
     key: str, label: str, entry: dict, period_seconds: int
 ) -> QuotaWindow | None:
     utilization = entry.get("utilization")
-    if not isinstance(utilization, (int, float)):
+    if isinstance(utilization, bool) or not isinstance(utilization, (int, float)):
         return None
     return QuotaWindow.from_percent(
         key=key,
@@ -144,7 +149,11 @@ def parse_usage(payload: dict) -> tuple[QuotaWindow, ...]:
                 continue
             slug = _slugify(display)
             percent = entry.get("percent")
-            if not slug or not isinstance(percent, (int, float)):
+            if (
+                not slug
+                or isinstance(percent, bool)
+                or not isinstance(percent, (int, float))
+            ):
                 continue
             push(
                 QuotaWindow.from_percent(

@@ -272,6 +272,28 @@ class CodexFetchTests(unittest.TestCase):
         self.assertEqual(snapshot.status, "parse_error")
         self.assertIn("no usage data", snapshot.error.message)
 
+    def test_additional_only_rate_limit_payload_is_available(self):
+        payload = {
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 12,
+                            "limit_window_seconds": 604800,
+                            "reset_at": 1784934400,
+                        }
+                    },
+                }
+            ]
+        }
+        snapshot = codex.fetch(
+            SENTINEL, FakeTransport(Response(200, json.dumps(payload))), now=NOW
+        )
+        self.assertEqual(snapshot.status, AVAILABLE)
+        self.assertEqual([window.key for window in snapshot.windows], ["spk/7d"])
+        self.assertEqual(snapshot.windows[0].used_percent, 12)
+
     def test_signal_key_with_no_parseable_windows_maps_to_parse_error(self):
         # "plan_type" is a recognized signal key, but its value is not a
         # vettable string and there is no rate_limit/credits data to parse
@@ -348,6 +370,44 @@ class CodexFetchTests(unittest.TestCase):
         self.assertIsNone(window.reset_at)
         credits = [w for w in snapshot.windows if w.key == "credits"]
         self.assertEqual(credits, [])
+
+    def test_boolean_rate_limit_numbers_are_rejected(self):
+        payload = {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": True,
+                    "limit_window_seconds": 18000,
+                },
+                "secondary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": True,
+                },
+            }
+        }
+        _, windows = codex.parse_usage(payload)
+        self.assertEqual([window.key for window in windows], ["7d"])
+        self.assertEqual(windows[0].used_percent, 25)
+        self.assertEqual(windows[0].period_seconds, 604800)
+
+    def test_oversized_integer_numbers_do_not_crash_parsing(self):
+        oversized = 10**310
+        payload = {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": oversized,
+                    "limit_window_seconds": oversized,
+                    "reset_at": oversized,
+                }
+            }
+        }
+        snapshot = codex.fetch(
+            SENTINEL, FakeTransport(Response(200, json.dumps(payload))), now=NOW
+        )
+        self.assertEqual(snapshot.status, AVAILABLE)
+        (window,) = snapshot.windows
+        self.assertEqual(window.used_percent, 0)
+        self.assertEqual(window.period_seconds, 18000)
+        self.assertIsNone(window.reset_at)
 
 
 class CodexDefaultClockTests(unittest.TestCase):

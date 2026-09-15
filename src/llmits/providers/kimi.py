@@ -66,14 +66,11 @@ def _numeric(value) -> float | None:
     """A finite number, accepting the payload's string-typed numbers too."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str):
-        try:
-            number = float(value.strip())
-        except ValueError:
-            return None
-    else:
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value.strip()) if isinstance(value, str) else float(value)
+    except (ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -86,9 +83,12 @@ def _parse_time(value) -> datetime | None:
         except ValueError:
             parsed = None
         if parsed is not None:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
+            try:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
     return common.epoch_to_datetime(_numeric(value))
 
 
