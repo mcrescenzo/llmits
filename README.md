@@ -99,7 +99,7 @@ Exit codes: `0` success, `1` a requested provider failed (this outranks the thre
 `llmits` reads existing credentials and never modifies them.
 
 - **Claude** — first match of: `--claude-credentials`, `LLMITS_CLAUDE_CREDENTIALS`, `$CLAUDE_CONFIG_DIR/.credentials.json`, `~/.claude/.credentials.json`. Log in with the Claude Code CLI (`claude login`) when the token expires.
-- **Codex** — first match of: `--codex-credentials`, `LLMITS_CODEX_CREDENTIALS`, `~/.codex/auth.json`. Log in with the Codex CLI when the token expires.
+- **Codex** — first match of: `--codex-credentials`, `LLMITS_CODEX_CREDENTIALS`, `$CODEX_HOME/auth.json`, `~/.codex/auth.json`. Log in with the Codex CLI when the token expires.
 - **Z.AI** — first usable source in this order:
   1. `ZAI_API_KEY`, then `ZHIPU_API_KEY`.
   2. `~/.pi/agent/auth.json`, entry `zai`, when it contains a literal `api_key` credential.
