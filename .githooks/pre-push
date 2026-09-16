@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tracked pre-push gate: full-history scan, then the complete release gate.
+# Tracked pre-push gate: the complete release gate, including the full-history
+# scan, executed exactly once through Make's dependency graph.
 #
 # Defense in depth for the person pushing, not the authoritative boundary --
 # continuous integration is. Install once per clone with: make install-hooks
@@ -9,7 +10,5 @@ cd "$(dirname "$0")/.."
 [ -t 0 ] || cat >/dev/null  # consume the ref-update lines Git feeds the hook
 
 PY="${PY:-python3}"
-echo "pre-push: scanning full repository history" >&2
-make history-check PY="$PY"
-echo "pre-push: running the complete release gate" >&2
+echo "pre-push: running the complete release gate, including the full-history scan" >&2
 make release-check PY="$PY"

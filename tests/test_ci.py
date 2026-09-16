@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import stat
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -211,13 +212,35 @@ class RepositoryHygieneContractTests(unittest.TestCase):
         self.assertIn("install-hooks:", self.makefile)
         self.assertIn("git config core.hooksPath .githooks", self.makefile)
 
-    def test_pre_push_hook_is_executable_and_runs_both_gates(self):
+    def test_pre_push_hook_is_executable_and_runs_the_gate_with_one_history_scan(self):
         self.assertTrue(PRE_PUSH.is_file())
         self.assertTrue(PRE_PUSH.stat().st_mode & stat.S_IXUSR)
         hook = PRE_PUSH.read_text()
-        self.assertIn("make history-check", hook)
-        self.assertIn("make release-check", hook)
         self.assertIn("set -euo pipefail", hook)
+        # The hook delegates the full-history scan to Make's dependency graph:
+        # a separate `make history-check` here would duplicate the most
+        # expensive gate, which `release-check` already runs as a prerequisite.
+        self.assertIn("make release-check", hook)
+        self.assertNotIn("make history-check", hook)
+        # A second gate invocation, or the scanner called directly from the
+        # hook, would run the full-history scan again outside the dependency
+        # graph; the count assertion keeps the single-invocation contract.
+        self.assertEqual(hook.count("make release-check"), 1)
+        self.assertNotIn("public_history.py", hook)
+        # The combined gate must still expand to exactly one full-history scan.
+        dry_run = subprocess.run(
+            ["make", "-n", "release-check", "PY=python"],
+            capture_output=True,
+            check=True,
+            cwd=REPO_ROOT,
+            text=True,
+        )
+        scan_lines = [
+            line
+            for line in dry_run.stdout.splitlines()
+            if "public_history.py --scan-history" in line
+        ]
+        self.assertEqual(len(scan_lines), 1, scan_lines)
 
     def test_dependabot_updates_github_actions_weekly(self):
         dependabot = DEPENDABOT.read_text()
