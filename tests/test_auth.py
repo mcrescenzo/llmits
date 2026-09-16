@@ -112,6 +112,33 @@ class GenericDiscoveryTests(IsolatedHomeMixin, unittest.TestCase):
         self.assertIn("wrong provider audience", ctx.exception.error.message)
         self.assertNotIn(SENTINEL, ctx.exception.error.message + ctx.exception.error.action)
 
+    def test_environment_source_rejects_credential_no_http_header_can_carry(self):
+        # http.client raises ValueError from putheader for a header value with
+        # an embedded bare CR/LF or a non-latin-1 character; discovery must
+        # reject such a value as a credential failure, never return it.
+        for label, value in (
+            ("embedded crlf", f"{SENTINEL}\r\ninjected"),
+            ("non-latin-1 character", f"{SENTINEL}\u4e2d"),
+        ):
+            with self.subTest(label=label):
+                os.environ["FIRST_TEST_KEY"] = value
+                spec = auth.CredentialSpec(
+                    provider="example",
+                    sources=(auth.EnvironmentSource("example", "FIRST_TEST_KEY"),),
+                    missing_message="example credential missing",
+                    missing_action="set an example credential",
+                )
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.discover_credential(spec)
+                error = ctx.exception.error
+                self.assertEqual(error.code, AUTH_REQUIRED)
+                self.assertIn("malformed credential value", error.message)
+                self.assertIn("single-line latin-1", error.action)
+                text = error.message + error.action + str(ctx.exception)
+                self.assertNotIn(SENTINEL, text)
+                self.assertNotIn("injected", text)
+                self.assertNotIn("\u4e2d", text)
+
     def test_optional_insecure_file_is_skipped_for_safe_fallback(self):
         path = make_creds(self.tmp, "tool.json", {"provider": {"key": DECOY}}, mode=0o644)
         os.environ["SECOND_TEST_KEY"] = SENTINEL
@@ -337,6 +364,44 @@ class ClaudeCredentialTests(IsolatedHomeMixin, unittest.TestCase):
         with self.assertRaises(auth.CredentialError) as tokenless:
             auth.read_claude_token(str(junk))
         self.assertEqual(missing.exception.error.action, tokenless.exception.error.action)
+
+    def test_rejects_token_no_http_header_can_carry(self):
+        # http.client raises ValueError from putheader for a header value with
+        # an embedded bare CR/LF or a non-latin-1 character, so such a token
+        # can never be sent; discovery must reject it as a credential failure
+        # instead of returning it for the transport to choke on mid-request.
+        for label, token in (
+            ("embedded crlf", f"{SENTINEL}\r\ninjected"),
+            ("embedded newline", f"{SENTINEL}\ninjected"),
+            ("embedded carriage return", f"{SENTINEL}\rinjected"),
+            ("non-latin-1 character", f"{SENTINEL}\u4e2d"),
+        ):
+            with self.subTest(label=label):
+                path = make_creds(
+                    self.tmp, ".claude/.credentials.json",
+                    {"claudeAiOauth": {"accessToken": token}},
+                )
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.read_claude_token()
+                error = ctx.exception.error
+                self.assertEqual(error.code, AUTH_REQUIRED)
+                self.assertIn("malformed access token", error.message)
+                self.assertIn("claude login", error.action)
+                text = error.message + error.action + str(ctx.exception)
+                self.assertNotIn(SENTINEL, text)
+                self.assertNotIn("injected", text)
+                self.assertNotIn("\u4e2d", text)
+                self.assertNotIn(str(path), text)
+
+    def test_latin1_obs_text_token_is_still_accepted(self):
+        # "\u00e9" is latin-1 obs-text that http.client sends without error,
+        # so the header check must reject only what cannot actually be sent.
+        token = SENTINEL + "\u00e9"
+        make_creds(
+            self.tmp, ".claude/.credentials.json",
+            {"claudeAiOauth": {"accessToken": token}},
+        )
+        self.assertEqual(auth.read_claude_token(), token)
 
 
 class CodexCredentialTests(IsolatedHomeMixin, unittest.TestCase):
@@ -819,6 +884,53 @@ class KimiCredentialTests(IsolatedHomeMixin, unittest.TestCase):
         with self.assertRaises(auth.CredentialError) as ctx:
             auth.read_kimi_key()
         self.assertIn("Kimi Coding Plan key not set", ctx.exception.error.message)
+
+    def test_optional_value_no_http_header_can_carry_is_skipped(self):
+        # A key that cannot be sent as a header value is malformed like any
+        # other malformed optional file: the source is skipped and a later
+        # valid source still wins.
+        for label, bad_key in (
+            ("embedded crlf", SENTINEL + "\r\ninjected"),
+            ("non-latin-1 character", SENTINEL + "\u4e2d"),
+        ):
+            with self.subTest(label=label):
+                make_creds(
+                    self.tmp,
+                    ".pi/agent/auth.json",
+                    {"kimi-coding": {"type": "api_key", "key": bad_key}},
+                )
+                kimi_home = self.tmp / "kimi-home"
+                os.environ["KIMI_CODE_HOME"] = str(kimi_home)
+                write_file(
+                    kimi_home, "config.toml", self.bound_cli_config("later-valid-key")
+                )
+                self.assertEqual(auth.read_kimi_key(), "later-valid-key")
+
+    def test_lone_optional_value_no_http_header_can_carry_is_ordinary_missing(self):
+        # With no later source to fall back on, a malformed optional value is
+        # conflated with absent per the documented optional contract: the
+        # provider's ordinary missing-key error surfaces, sanitized.
+        for label, bad_key in (
+            ("embedded crlf", SENTINEL + "\r\ninjected"),
+            ("non-latin-1 character", SENTINEL + "\u4e2d"),
+        ):
+            with self.subTest(label=label):
+                make_creds(
+                    self.tmp,
+                    ".pi/agent/auth.json",
+                    {"kimi-coding": {"type": "api_key", "key": bad_key}},
+                )
+                with self.assertRaises(auth.CredentialError) as ctx:
+                    auth.read_kimi_key()
+                error = ctx.exception.error
+                self.assertEqual(error.code, AUTH_REQUIRED)
+                self.assertIn("Kimi Coding Plan key not set", error.message)
+                self.assertIn("kimi-cli", error.action)
+                text = error.message + error.action + str(ctx.exception)
+                self.assertNotIn("malformed", text)
+                self.assertNotIn(SENTINEL, text)
+                self.assertNotIn("injected", text)
+                self.assertNotIn("\u4e2d", text)
 
     def test_missing_is_actionable(self):
         with self.assertRaises(auth.CredentialError) as ctx:

@@ -62,6 +62,23 @@ class CredentialSource(Protocol):
     def resolve(self) -> str | None: ...
 
 
+def _is_header_encodable(value: str) -> bool:
+    """Whether a credential value can be sent as an HTTP header field value.
+
+    ``http.client`` raises ``ValueError`` from ``putheader`` for a value that
+    cannot be encoded as latin-1 or that contains a bare CR or LF, so such a
+    credential can never be sent: rejecting it at discovery time surfaces a
+    credential problem where it belongs instead of an unexpected transport
+    exception mid-request. Latin-1 obs-text (e.g. an accented letter) is
+    encodable and stays accepted.
+    """
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return "\r" not in value and "\n" not in value
+
+
 @dataclass(frozen=True)
 class EnvironmentSource:
     """One provider-bound environment variable in a precedence chain."""
@@ -71,7 +88,15 @@ class EnvironmentSource:
 
     def resolve(self) -> str | None:
         value = os.environ.get(self.variable)
-        return value.strip() if value and value.strip() else None
+        if not value or not value.strip():
+            return None
+        token = value.strip()
+        if not _is_header_encodable(token):
+            raise CredentialError(
+                f"{self.variable} contains a malformed credential value",
+                f"re-export {self.variable} as a single-line latin-1 value",
+            )
+        return token
 
 
 @dataclass(frozen=True)
@@ -226,7 +251,15 @@ class StructuredFileSource:
             raise
         value = self.extract(payload)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            token = value.strip()
+            if not _is_header_encodable(token):
+                if self.optional:
+                    return None
+                raise CredentialError(
+                    f"{self.what} contains a malformed access token",
+                    self.missing_action,
+                )
+            return token
         if self.optional:
             return None
         raise CredentialError(
