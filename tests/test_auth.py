@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -304,6 +305,91 @@ class SecureReadTomlTests(IsolatedHomeMixin, unittest.TestCase):
             with self.assertRaises(auth.CredentialError) as ctx:
                 auth.secure_read_toml(path, "Codex config file")
         self.assertIn("unexpected format", ctx.exception.error.message)
+
+
+class OversizedIntegerLiteralTests(IsolatedHomeMixin, unittest.TestCase):
+    """Both decode boundaries must classify a >4300-digit integer literal.
+
+    Python 3.11+ makes ``json.loads`` and ``tomllib.loads`` raise a plain
+    ``ValueError`` (neither ``JSONDecodeError`` nor ``TOMLDecodeError``) for
+    an integer literal beyond the interpreter's int-string digit limit: a
+    malformed credential source, never an escaping ``ValueError``. Strict
+    sources must raise the sanitized credential error; optional sources
+    must be skipped so discovery continues.
+    """
+
+    def oversized_digits(self):
+        # Pin the documented default limit and restore the previous value so
+        # an ambient PYTHONINTMAXSTRDIGITS can never change the outcome; the
+        # literal is built from the pinned value, not a hard-coded length.
+        previous_limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
+        return "9" * (sys.get_int_max_str_digits() + 1)
+
+    def test_strict_json_source_raises_sanitized_credential_error(self):
+        path = write_file(
+            self.tmp,
+            "claude-credentials.json",
+            '{"claudeAiOauth": {"accessToken": ' + self.oversized_digits() + "}}",
+        )
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_claude_token(str(path))
+        error = ctx.exception.error
+        self.assertEqual(error.code, AUTH_REQUIRED)
+        self.assertEqual(error.message, "Claude credentials file is not valid JSON")
+        self.assertEqual(error.action, "log in again with the official CLI to recreate the file")
+        text = error.message + error.action + str(ctx.exception)
+        self.assertNotIn("9999", text)
+        self.assertNotIn(str(path), text)
+
+    def test_optional_json_source_is_skipped_and_later_source_wins(self):
+        write_file(
+            self.tmp,
+            ".pi/agent/auth.json",
+            '{"zai": {"type": "api_key", "key": ' + self.oversized_digits() + "}}",
+        )
+        make_creds(
+            self.tmp,
+            ".claude/settings.json",
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                    "ANTHROPIC_AUTH_TOKEN": SENTINEL,
+                }
+            },
+        )
+        self.assertEqual(auth.read_zai_key(), SENTINEL)
+
+    def test_toml_loader_classifies_literal_as_invalid_toml(self):
+        path = write_file(self.tmp, "config.toml", "key = " + self.oversized_digits() + "\n")
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.secure_read_toml(path, "Codex config file")
+        error = ctx.exception.error
+        self.assertEqual(error.code, AUTH_REQUIRED)
+        self.assertEqual(error.message, "Codex config file is not valid TOML")
+        self.assertEqual(error.action, "reconfigure the official tool to recreate the file")
+        text = error.message + error.action + str(ctx.exception)
+        self.assertNotIn("9999", text)
+        self.assertNotIn(str(path), text)
+
+    def test_optional_toml_source_is_skipped_as_ordinary_missing(self):
+        write_file(
+            self.tmp,
+            ".kimi-code/config.toml",
+            '[providers.kimi-code]\n'
+            'base_url = "https://api.kimi.com/coding/v1"\n'
+            "api_key = " + self.oversized_digits() + "\n",
+        )
+        with self.assertRaises(auth.CredentialError) as ctx:
+            auth.read_kimi_key()
+        error = ctx.exception.error
+        self.assertEqual(error.code, AUTH_REQUIRED)
+        self.assertIn("Kimi Coding Plan key not set", error.message)
+        text = error.message + error.action + str(ctx.exception)
+        self.assertNotIn("not valid TOML", text)
+        self.assertNotIn("9999", text)
+        self.assertNotIn(str(self.tmp), text)
 
 
 class ClaudeCredentialTests(IsolatedHomeMixin, unittest.TestCase):
