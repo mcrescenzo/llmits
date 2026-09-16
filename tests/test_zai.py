@@ -1,14 +1,22 @@
+import hashlib
 import json
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from llmits.models import AVAILABLE, AUTH_REQUIRED, UNAVAILABLE
+from llmits.models import AVAILABLE, AUTH_REQUIRED, MAX_KEY, UNAVAILABLE, sanitize_text
 from llmits.providers import zai
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SENTINEL = "zai-plan-sentinel-key"
+
+
+def label_digest(label: str) -> str:
+    # Mirrors zai's unknown-kind disambiguator for ordinary labels: the
+    # first 12 hex characters of sha256 over the UTF-8 bytes of the full
+    # label text (never of the truncated slug).
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
 
 
 def fixture(name: str) -> dict:
@@ -110,6 +118,137 @@ class ZaiParseTests(unittest.TestCase):
         plan, windows = zai.parse_usage(payload)
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].used_percent, 10)
+
+    def test_shared_slug_prefix_labels_keep_distinct_windows(self):
+        # Both labels slug to future_quota_alpha_x: the differing character
+        # is the slug's 21st, cut off by _label_slug's [:20]. The legacy key
+        # other:future_quota_alpha_x is genuinely contested, so each distinct
+        # label keeps a distinct digest-suffixed key, in source order,
+        # instead of the second window being dropped by the de-dup.
+        payload = {
+            "code": 200,
+            "msg": "ok",
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {"type": "Future Quota Alpha XX", "rawType": "FUTURE_LIMIT", "percentage": 10},
+                    {"type": "Future Quota Alpha XY", "rawType": "FUTURE_LIMIT", "percentage": 20},
+                ],
+            },
+        }
+        plan, windows = zai.parse_usage(payload)
+        self.assertEqual(
+            [w.key for w in windows],
+            [
+                f"other:future_quota_alpha_x:{label_digest('Future Quota Alpha XX')}",
+                f"other:future_quota_alpha_x:{label_digest('Future Quota Alpha XY')}",
+            ],
+        )
+        self.assertEqual([w.used_percent for w in windows], [10, 20])
+        # Same payload in, same keys out: the scheme is never order-dependent.
+        self.assertEqual(zai.parse_usage(payload), (plan, windows))
+
+    def test_empty_slug_labels_keep_distinct_windows(self):
+        # Neither non-ASCII label contains an [a-z0-9] run, so both slug
+        # to "" and the legacy key "other" is contested; both windows
+        # survive with distinct digest-suffixed keys in source order.
+        payload = {
+            "code": 200,
+            "msg": "ok",
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {"type": "五時間枠", "rawType": "FUTURE_LIMIT", "percentage": 10},
+                    {"type": "週間枠", "rawType": "FUTURE_LIMIT", "percentage": 20},
+                ],
+            },
+        }
+        _, windows = zai.parse_usage(payload)
+        self.assertEqual(
+            [w.key for w in windows],
+            [f"other:{label_digest('五時間枠')}", f"other:{label_digest('週間枠')}"],
+        )
+        self.assertEqual([w.used_percent for w in windows], [10, 20])
+
+    def test_contested_slug_exact_duplicates_still_collapse(self):
+        # The third entry repeats the first label exactly: same digest,
+        # same key, so parse_usage's de-dup still collapses it even inside
+        # a contested slug group.
+        payload = {
+            "code": 200,
+            "msg": "ok",
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {"type": "Future Quota Alpha XX", "rawType": "FUTURE_LIMIT", "percentage": 10},
+                    {"type": "Future Quota Alpha XY", "rawType": "FUTURE_LIMIT", "percentage": 20},
+                    {"type": "Future Quota Alpha XX", "rawType": "FUTURE_LIMIT", "percentage": 30},
+                ],
+            },
+        }
+        _, windows = zai.parse_usage(payload)
+        self.assertEqual([w.used_percent for w in windows], [10, 20])
+
+    def test_known_kind_keys_are_unchanged(self):
+        # Every known-kind branch keeps its byte-identical key (rawType
+        # shape and bare-type-token shape), a bare-token duplicate still
+        # de-dupes into the first "5h", and an uncontested unknown-kind
+        # label keeps today's legacy key — no churn from the fallback-key
+        # pre-pass. The recorded fixtures pin the same keys in the fixture
+        # tests above (zai_quota_full/credit/sparse/synthetic).
+        payload = {
+            "code": 200,
+            "msg": "ok",
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {"type": "5h Token", "rawType": "TOKENS_LIMIT", "unit": 3, "percentage": 11},
+                    {"type": "Weekly Token", "rawType": "TOKENS_LIMIT", "unit": 6, "percentage": 12},
+                    {"type": "Monthly Token", "rawType": "TOKENS_LIMIT", "unit": 5, "percentage": 13},
+                    {"type": "5h", "rawType": "CREDIT_LIMIT", "unit": 3, "percentage": 14},
+                    {"type": "Weekly", "rawType": "CREDIT_LIMIT", "unit": 6, "percentage": 15},
+                    {"type": "Monthly", "rawType": "CREDIT_LIMIT", "unit": 5, "percentage": 16},
+                    {"type": "MCP", "rawType": "TIME_LIMIT", "unit": 5, "percentage": 17},
+                    {"type": "TOKENS_LIMIT", "unit": 3, "percentage": 18},
+                    {"type": "Weekly token budget", "unit": 6, "percentage": 40},
+                ],
+            },
+        }
+        _, windows = zai.parse_usage(payload)
+        self.assertEqual(
+            [w.key for w in windows],
+            [
+                "5h",
+                "weekly",
+                "tokens",
+                "5h_credits",
+                "weekly_credits",
+                "credits_other",
+                "monthly_mcp",
+                "other:weekly_token_budget",
+            ],
+        )
+
+    def test_unknown_keys_are_stable_under_key_sanitization(self):
+        # The contested-label keys are ASCII [a-z0-9_:] and stay far below
+        # MAX_KEY (worst case "other:" + 20 + ":" + 12 hex + a tie-break
+        # suffix), so QuotaWindow's sanitize_text(key, MAX_KEY) can neither
+        # rewrite nor truncate them into a fresh collision: the stored
+        # window keys are byte-identical to the keys built for them.
+        entries = [
+            {"type": "Future Quota Alpha XX", "rawType": "FUTURE_LIMIT", "percentage": 10},
+            {"type": "Future Quota Alpha XY", "rawType": "FUTURE_LIMIT", "percentage": 20},
+            {"type": "五時間枠", "rawType": "FUTURE_LIMIT", "percentage": 30},
+            {"type": "週間枠", "rawType": "FUTURE_LIMIT", "percentage": 40},
+        ]
+        pre_keys = [key for key in zai._fallback_keys(entries) if key is not None]
+        self.assertEqual(len(pre_keys), 4)
+        self.assertEqual(len(set(pre_keys)), 4)
+        for key in pre_keys:
+            self.assertLessEqual(len(key), MAX_KEY)
+            self.assertEqual(sanitize_text(key, MAX_KEY), key)
+        _, windows = zai.parse_usage({"code": 200, "data": {"limits": entries}})
+        self.assertEqual([w.key for w in windows], pre_keys)
 
     def test_synthetic_fixture_shape_without_rawtype(self):
         # Synthetic edge-case fixture (tests/fixtures/zai_quota_synthetic.json):
