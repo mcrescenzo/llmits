@@ -60,9 +60,13 @@ class Segment:
 class Glyphs:
     """One glyph set: unicode line-drawing, or a plain-ASCII fallback.
 
-    ``run_tui`` picks between the two based on the stdout encoding; the
-    pure renderer below never decides this itself, it only consumes
-    whichever set it is given.
+    ``run_tui`` picks between the two from ``_terminal_codeset()``, which
+    prefers ``locale.nl_langinfo(locale.CODESET)``, the codeset ncurses
+    actually draws under, and falls back to the stream's declared encoding
+    only where ``nl_langinfo`` is unavailable. ``_select_glyphs`` then takes
+    the unicode set when that codeset names UTF-8 and the ASCII set
+    otherwise. The pure renderer below never decides this itself, it only
+    consumes whichever set it is given.
     """
 
     fill: str
