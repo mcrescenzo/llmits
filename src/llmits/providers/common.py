@@ -142,7 +142,12 @@ def decode_json_object(
     # carries the plain ValueError json.loads raises for an integer literal
     # beyond the interpreter's int-string digit limit (Python 3.11+): still
     # an untrusted malformed body, so the same sanitized snapshot applies.
-    except ValueError:
+    # RecursionError covers bodies nested past the interpreter's recursion
+    # guard — equally malformed input, and already treated as such by the
+    # credential-file boundaries in auth.secure_read_json/toml. The
+    # RecursionError text itself (which reports stack usage) is untrusted
+    # and never reaches the snapshot.
+    except (ValueError, RecursionError):
         return parse_error_snapshot(provider, f"{display} returned invalid JSON", now)
     if not isinstance(payload, dict):
         return parse_error_snapshot(provider, f"{display} returned an unexpected payload", now)
