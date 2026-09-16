@@ -435,6 +435,44 @@ class CodexFetchTests(unittest.TestCase):
         self.assertIsNone(snapshot.plan_name)
         self.assertEqual(snapshot.windows, ())
 
+    def test_deeply_nested_body_maps_to_parse_error(self):
+        # llmits-9kv: a hostile HTTP 200 body nested beyond the interpreter
+        # recursion guard makes json.loads raise RecursionError inside the
+        # shared decode boundary; it is neither a ValueError nor a
+        # TransportError, so without the widened catch it escapes the
+        # adapter entirely (service.py then reports it as an "internal
+        # provider error"). Same pinning rationale as the common-level test:
+        # the pinned limit sits well above the runner's call depth and is
+        # restored afterwards, and the depth stays under the 1 MiB response
+        # cap. CPython 3.12+ scales its guard with the C stack rather than
+        # this limit, so the assertion below accepts either sanitized
+        # parse-error message and the test does not depend on stack size.
+        # Built by byte multiplication so constructing the body does not
+        # itself recurse.
+        previous_limit = sys.getrecursionlimit()
+        pinned = 300
+        sys.setrecursionlimit(pinned)
+        self.addCleanup(sys.setrecursionlimit, previous_limit)
+        depth = pinned * 1000
+        body = b"[" * depth + b"]" * depth
+        snapshot = codex.fetch(
+            SENTINEL, FakeTransport(Response(200, body)), now=NOW
+        )
+        self.assertEqual(snapshot.status, PARSE_ERROR)
+        # Where the guard trips the body is "not valid JSON"; on a C stack
+        # large enough to finish the parse the nested array is an "unexpected
+        # payload" instead. Both are sanitized parse errors.
+        self.assertIn(
+            snapshot.error.message,
+            {"Codex returned invalid JSON", "Codex returned an unexpected payload"},
+        )
+        # The snapshot is fully sanitized: no payload bytes and no exception
+        # text survive, only the fixed message.
+        self.assertNotIn("RecursionError", snapshot.error.message)
+        self.assertNotIn("[", snapshot.error.message)
+        self.assertIsNone(snapshot.plan_name)
+        self.assertEqual(snapshot.windows, ())
+
 
 class CodexDefaultClockTests(unittest.TestCase):
     def test_fetch_with_now_none_falls_back_to_common_utcnow(self):

@@ -133,6 +133,40 @@ class TestDecodeJsonObject(unittest.TestCase):
         self.assertEqual(result.status, PARSE_ERROR)
         self.assertEqual(result.error.message, "Codex returned invalid JSON")
 
+    def test_deeply_nested_json_is_parse_error_not_recursion_error(self):
+        # llmits-9kv: a body of nested arrays deeper than the interpreter's
+        # recursion guard makes json.loads raise RecursionError, which is not
+        # a ValueError, so without the widened catch it escapes this shared
+        # boundary and every adapter. The limit is pinned well above the test
+        # runner's call depth (about a dozen frames) and restored afterwards,
+        # so CPython <= 3.11 — where json's guard follows
+        # sys.setrecursionlimit — can never depend on ambient settings. On
+        # 3.12+ the guard is not controllable that way: it is a fixed constant
+        # on 3.12/3.13 (about 10k nesting levels) and scales with the C stack
+        # on 3.14 (about 100k at the default 8 MiB, and no trip at all with an
+        # unlimited stack). The depth stays under the 1 MiB response cap and
+        # far above the usual guards, and the assertions below accept either
+        # sanitized parse-error message, so the test proves the contract —
+        # RecursionError never escapes — without depending on the runner's
+        # stack size. The body is built by byte multiplication so
+        # constructing it does not itself recurse.
+        previous_limit = sys.getrecursionlimit()
+        pinned = 300
+        sys.setrecursionlimit(pinned)
+        self.addCleanup(sys.setrecursionlimit, previous_limit)
+        depth = pinned * 1000
+        body = b"[" * depth + b"]" * depth
+        result = common.decode_json_object("codex", "Codex", body, self._now())
+        self.assertIsInstance(result, ProviderSnapshot)
+        self.assertEqual(result.status, PARSE_ERROR)
+        # Where the guard trips the body is "not valid JSON"; on a C stack
+        # large enough to finish the parse the nested array is an "unexpected
+        # payload" instead. Both are sanitized parse errors.
+        self.assertIn(
+            result.error.message,
+            {"Codex returned invalid JSON", "Codex returned an unexpected payload"},
+        )
+
     def test_non_object_json_is_parse_error(self):
         result = common.decode_json_object("zai", "Z.AI", b"[1, 2, 3]", self._now())
         self.assertIsInstance(result, ProviderSnapshot)
