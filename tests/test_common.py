@@ -1,4 +1,5 @@
 import math
+import sys
 import unittest
 from datetime import datetime, timezone
 
@@ -114,6 +115,23 @@ class TestDecodeJsonObject(unittest.TestCase):
         self.assertIsInstance(result, ProviderSnapshot)
         self.assertEqual(result.status, PARSE_ERROR)
         self.assertIn("invalid JSON", result.error.message)
+
+    def test_oversized_json_integer_literal_is_parse_error(self):
+        # A body that is syntactically JSON but carries an integer literal
+        # beyond the interpreter's int-string digit limit (Python 3.11+;
+        # 4300 digits by default) makes json.loads raise a plain ValueError
+        # that is not a JSONDecodeError — the boundary must normalize it
+        # rather than let it escape the adapter. The limit is pinned to the
+        # documented default and restored afterwards so an ambient
+        # PYTHONINTMAXSTRDIGITS can never change the outcome.
+        previous_limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
+        body = b'{"used_percent": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}"
+        result = common.decode_json_object("codex", "Codex", body, self._now())
+        self.assertIsInstance(result, ProviderSnapshot)
+        self.assertEqual(result.status, PARSE_ERROR)
+        self.assertEqual(result.error.message, "Codex returned invalid JSON")
 
     def test_non_object_json_is_parse_error(self):
         result = common.decode_json_object("zai", "Z.AI", b"[1, 2, 3]", self._now())
