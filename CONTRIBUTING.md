@@ -59,7 +59,7 @@ Install the tracked pre-push gate once per clone:
 make install-hooks
 ```
 
-This sets `core.hooksPath` to `.githooks/`, so `git push` first runs the full-history scan and then the complete release gate. Hooks are bypassable with `git push --no-verify`, so they are defense in depth for the person pushing; continuous integration is the authoritative boundary.
+This sets `core.hooksPath` to `.githooks/`, so `git push` runs the complete release gate, whose dependency graph includes the full-history scan exactly once. Hooks are bypassable with `git push --no-verify`, so they are defense in depth for the person pushing; continuous integration is the authoritative boundary.
 
 ## Change guidelines
 
