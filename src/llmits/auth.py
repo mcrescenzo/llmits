@@ -192,7 +192,11 @@ def secure_read_json(path: Path, what: str) -> dict:
     """Securely read a credential-bearing JSON object."""
     try:
         payload = json.loads(_secure_read_bytes(path, what).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    # ValueError subsumes UnicodeDecodeError and JSONDecodeError and also
+    # carries the plain ValueError json.loads raises for an integer literal
+    # beyond the interpreter's int-string digit limit (Python 3.11+): still a
+    # malformed credential source, so the same sanitized error applies.
+    except (ValueError, RecursionError):
         raise CredentialError(
             f"{what} is not valid JSON",
             "log in again with the official CLI to recreate the file",
@@ -209,7 +213,12 @@ def secure_read_toml(path: Path, what: str) -> dict:
     """Securely read a credential-bearing TOML document."""
     try:
         payload = tomllib.loads(_secure_read_bytes(path, what).decode("utf-8"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError):
+    # ValueError subsumes UnicodeDecodeError and TOMLDecodeError and also
+    # carries the plain ValueError tomllib.loads raises for an integer
+    # literal beyond the interpreter's int-string digit limit (Python 3.11+,
+    # via int(match.group(), 0) in tomllib._re): still a malformed credential
+    # source, so the same sanitized error applies.
+    except (ValueError, RecursionError):
         raise CredentialError(
             f"{what} is not valid TOML",
             "reconfigure the official tool to recreate the file",
