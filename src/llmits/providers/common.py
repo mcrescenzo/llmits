@@ -138,7 +138,11 @@ def decode_json_object(
     """
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    # ValueError subsumes UnicodeDecodeError and JSONDecodeError and also
+    # carries the plain ValueError json.loads raises for an integer literal
+    # beyond the interpreter's int-string digit limit (Python 3.11+): still
+    # an untrusted malformed body, so the same sanitized snapshot applies.
+    except ValueError:
         return parse_error_snapshot(provider, f"{display} returned invalid JSON", now)
     if not isinstance(payload, dict):
         return parse_error_snapshot(provider, f"{display} returned an unexpected payload", now)

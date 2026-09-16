@@ -1,11 +1,12 @@
 import json
+import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from llmits.http import TransportError
-from llmits.models import AVAILABLE, AUTH_REQUIRED
+from llmits.models import AVAILABLE, AUTH_REQUIRED, PARSE_ERROR
 from llmits.providers import codex
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -408,6 +409,31 @@ class CodexFetchTests(unittest.TestCase):
         self.assertEqual(window.used_percent, 0)
         self.assertEqual(window.period_seconds, 18000)
         self.assertIsNone(window.reset_at)
+
+    def test_oversized_integer_literal_body_maps_to_parse_error(self):
+        # llmits-6wg: a hostile HTTP 200 body can be syntactically JSON yet
+        # carry an integer literal longer than the interpreter's int-string
+        # digit limit; json.loads then raises a plain ValueError that is
+        # neither a JSONDecodeError nor a TransportError, so fetch must
+        # return the sanitized parse_error snapshot instead of raising out
+        # of the adapter. The limit is pinned to the documented default and
+        # restored afterwards so an ambient PYTHONINTMAXSTRDIGITS can never
+        # change the outcome.
+        previous_limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
+        body = (
+            b'{"rate_limit": {"primary_window": {"used_percent": '
+            + b"9" * (sys.get_int_max_str_digits() + 1)
+            + b"}}}"
+        )
+        snapshot = codex.fetch(
+            SENTINEL, FakeTransport(Response(200, body)), now=NOW
+        )
+        self.assertEqual(snapshot.status, PARSE_ERROR)
+        self.assertEqual(snapshot.error.message, "Codex returned invalid JSON")
+        self.assertIsNone(snapshot.plan_name)
+        self.assertEqual(snapshot.windows, ())
 
 
 class CodexDefaultClockTests(unittest.TestCase):
