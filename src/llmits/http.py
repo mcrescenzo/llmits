@@ -69,8 +69,45 @@ def _apply_request_deadline(connection: http.client.HTTPSConnection, deadline: f
         sock.settimeout(remaining)
 
 
+_SockAddr = tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]
+_AddressEntry = tuple[socket.AddressFamily, socket.SocketKind, int, str, _SockAddr]
+
+
+def _resolve_addresses(host: str, port: int) -> list[_AddressEntry]:
+    """Resolve ``host`` to stream socket addresses (the DNS step).
+
+    Injectable seam over ``socket.getaddrinfo``. The standard library
+    cannot preempt a lookup mid-call, so this step is not itself
+    abortable; the single request deadline still holds because every
+    later blocking step re-derives only the remaining budget.
+    """
+    return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+
+
+def _connect_address(
+    entry: _AddressEntry, timeout: float, source_address: tuple[str, int] | None
+) -> socket.socket:
+    """Bind and connect a single resolved address within ``timeout`` seconds.
+
+    Injectable seam that mirrors ``socket.create_connection`` for one
+    getaddrinfo result: same option handling, binding, and connect, but
+    with an explicit per-attempt timeout the caller recomputes.
+    """
+    family, socktype, proto, _canonname, address = entry
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.settimeout(timeout)
+        if source_address:
+            sock.bind(source_address)
+        sock.connect(address)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPS connection whose TCP, TLS, and later I/O share one deadline."""
+    """HTTPS connection whose name resolution, TCP, TLS, and later I/O share one deadline."""
 
     def __init__(self, *args, deadline: float, **kwargs) -> None:
         self._request_deadline = deadline
@@ -83,12 +120,34 @@ class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
         if getattr(self, "_tunnel_host", None) is not None:
             raise TransportError("proxy tunnels are not supported")
         sys.audit("http.client.connect", self, self.host, self.port)
-        self.timeout = _remaining_request_time(self._request_deadline)
-        self.sock = self._create_connection(  # type: ignore[attr-defined]
-            (self.host, self.port),
-            self.timeout,
-            self.source_address,  # type: ignore[attr-defined]
-        )
+        # Name resolution and dialing are separate steps so the budget can
+        # be re-derived before every blocking call. socket.getaddrinfo
+        # cannot be preempted mid-call, so a slow lookup is not itself
+        # abortable, but it must shrink — never reset — the budget handed
+        # to the attempts that follow: each address receives only the
+        # remaining time, so N failing addresses cannot consume N fresh
+        # timeouts.
+        entries = _resolve_addresses(self.host, self.port)
+        sock: socket.socket | None = None
+        last_error: OSError | None = None
+        for entry in entries:
+            self.timeout = _remaining_request_time(self._request_deadline)
+            try:
+                sock = _connect_address(
+                    entry,
+                    self.timeout,
+                    self.source_address,  # type: ignore[attr-defined]
+                )
+                break
+            except OSError as exc:
+                last_error = exc
+        if sock is None:
+            if last_error is not None:
+                raise last_error
+            # Match socket.create_connection: an empty address list is a
+            # connection error, not a deadline event.
+            raise OSError("getaddrinfo returns an empty list")
+        self.sock = sock
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as exc:

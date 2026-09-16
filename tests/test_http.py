@@ -1,5 +1,6 @@
 import http.client
 import os
+import socket
 import ssl
 import tempfile
 import unittest
@@ -64,6 +65,25 @@ class FakeConnection:
         self.closed = True
 
 
+class FakeTlsContext:
+    """TLS context double: records server_hostname and returns the socket."""
+
+    verify_mode = ssl.CERT_REQUIRED
+    check_hostname = True
+
+    def __init__(self):
+        self.server_hostname = None
+
+    def wrap_socket(self, sock, server_hostname):
+        self.server_hostname = server_hostname
+        return sock
+
+
+def fake_address_entry(address):
+    """One getaddrinfo-shaped entry for an invented TEST-NET address."""
+    return (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))
+
+
 class TransportHarness(unittest.TestCase):
     def setUp(self):
         self.contexts = []
@@ -110,16 +130,7 @@ class ConnectionTests(TransportHarness):
 
     def test_tcp_tls_and_request_io_share_the_remaining_deadline(self):
         raw_socket = FakeSocket()
-
-        class FakeContext:
-            verify_mode = ssl.CERT_REQUIRED
-            check_hostname = True
-
-            def wrap_socket(self, sock, server_hostname):
-                self.server_hostname = server_hostname
-                return sock
-
-        context = FakeContext()
+        context = FakeTlsContext()
         connection = ll_http._DeadlineHTTPSConnection(
             "chatgpt.com",
             443,
@@ -127,17 +138,31 @@ class ConnectionTests(TransportHarness):
             context=context,
             deadline=10.0,
         )
-        connect_timeouts = []
+        entry = fake_address_entry("192.0.2.10")
+        resolutions = []
+        attempts = []
 
-        def create_connection(address, timeout, source_address):
-            connect_timeouts.append(timeout)
+        def resolve(host, port):
+            resolutions.append((host, port))
+            ll_http.time.monotonic()  # resolution consumes 3s: 1.0 -> 4.0
+            return [entry]
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append((entry, timeout, source_address))
             return raw_socket
 
-        connection._create_connection = create_connection
-        with mock.patch.object(ll_http.time, "monotonic", side_effect=[1.0, 4.0, 7.0]):
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[1.0, 4.0, 4.0, 7.0, 7.0]
+        ):
             connection.connect()
 
-        self.assertEqual(connect_timeouts, [9.0])
+        self.assertEqual(resolutions, [("chatgpt.com", 443)])
+        # The 3s spent in resolution is deducted: the dial gets only the
+        # remaining budget, never a fresh TIMEOUT_SECONDS.
+        self.assertEqual(attempts, [(entry, 6.0, None)])
+        # TLS and later I/O share what is left of the same deadline.
         self.assertEqual(raw_socket.timeouts, [6.0, 3.0])
         self.assertEqual(context.server_hostname, "chatgpt.com")
 
@@ -153,6 +178,199 @@ class ConnectionTests(TransportHarness):
         self.assertEqual(path, "/api/oauth/usage")
         self.assertEqual(headers["Authorization"], "Bearer tok")
         self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+
+
+class ConnectPhaseDeadlineTests(unittest.TestCase):
+    """One deadline spans name resolution and every resolved-address attempt.
+
+    The resolver and single-address connector are fakes and every address
+    is an invented TEST-NET value, so no test here performs a real DNS
+    lookup or network connection. Fakes advance the mocked monotonic
+    clock to model how much of the single 10s budget each step consumes.
+    """
+
+    def _connection(self, context=None):
+        return ll_http._DeadlineHTTPSConnection(
+            "chatgpt.com",
+            443,
+            timeout=10.0,
+            context=context if context is not None else FakeTlsContext(),
+            deadline=10.0,
+        )
+
+    def _transport(self):
+        return ll_http.HttpTransport(
+            ssl_context_factory=FakeTlsContext,
+            connection_factory=ll_http._DeadlineHTTPSConnection,
+        )
+
+    def test_resolution_cost_leaves_only_the_remainder_for_attempts(self):
+        entries = [fake_address_entry("192.0.2.10"), fake_address_entry("192.0.2.11")]
+        attempts = []
+
+        def resolve(host, port):
+            # Resolution starts at 0.0; the first budget recompute reads
+            # 4.0, so DNS consumed 4s of the 10s budget.
+            ll_http.time.monotonic()
+            return entries
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append((entry[4], timeout))
+            ll_http.time.monotonic()  # a failed attempt consumes 3s more
+            raise ConnectionRefusedError()
+
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[0.0, 4.0, 7.0, 7.0, 7.0, 7.0]
+        ):
+            with self.assertRaises(ConnectionRefusedError):
+                self._connection().connect()
+
+        # Every attempt receives a decreasing remainder, never the fresh
+        # 10.0 timeout the old single socket.create_connection call used.
+        self.assertEqual([timeout for _, timeout in attempts], [6.0, 3.0])
+        self.assertEqual(
+            [address for address, _ in attempts],
+            [("192.0.2.10", 443), ("192.0.2.11", 443)],
+        )
+
+    def test_spent_deadline_stops_attempts_and_surfaces_transport_error(self):
+        entries = [
+            fake_address_entry(address)
+            for address in ("192.0.2.10", "192.0.2.11", "192.0.2.12")
+        ]
+        attempts = []
+
+        def resolve(host, port):
+            return entries
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append((entry[4], timeout))
+            ll_http.time.monotonic()  # each failing attempt consumes its budget
+            raise ConnectionRefusedError()
+
+        # get() reads 0.0 for the deadline; the budget recomputes then see
+        # 2.0, 5.0, and 11.0, so the third address is never attempted.
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[0.0, 2.0, 5.0, 5.0, 11.0, 11.0, 11.0]
+        ):
+            with self.assertRaises(ll_http.RequestDeadlineExceeded) as ctx:
+                self._transport().get("chatgpt.com", "/p", {})
+
+        self.assertEqual(
+            str(ctx.exception), "provider request exceeded the total time limit"
+        )
+        self.assertEqual([timeout for _, timeout in attempts], [8.0, 5.0])
+        # The third address proves the deadline ended the phase instead of
+        # granting each address a fresh full timeout.
+        self.assertEqual(len(attempts), 2)
+
+    def test_successful_later_address_connects_and_tls_wraps_with_server_hostname(self):
+        raw_socket = FakeSocket()
+        context = FakeTlsContext()
+        entries = [fake_address_entry("192.0.2.10"), fake_address_entry("192.0.2.11")]
+        attempts = []
+
+        def resolve(host, port):
+            ll_http.time.monotonic()  # resolution consumes 3s: 1.0 -> 4.0
+            return entries
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append((entry[4], timeout))
+            if entry is entries[0]:
+                ll_http.time.monotonic()  # the failed attempt consumes 2s more
+                raise ConnectionRefusedError()
+            return raw_socket
+
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[1.0, 4.0, 6.0, 6.0, 6.0, 9.0, 9.0]
+        ):
+            connection = self._connection(context)
+            connection.connect()
+
+        # The later address still connects once budget remains, and the
+        # whole chain keeps sharing one deadline.
+        self.assertEqual([timeout for _, timeout in attempts], [6.0, 4.0])
+        self.assertIs(connection.sock, raw_socket)
+        self.assertEqual(context.server_hostname, "chatgpt.com")
+        self.assertEqual(raw_socket.timeouts, [4.0, 1.0])
+        self.assertIn(
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1), raw_socket.socket_options
+        )
+
+    def test_resolution_exceeding_deadline_fails_fast_without_connecting(self):
+        attempts = []
+
+        def resolve(host, port):
+            ll_http.time.monotonic()  # resolution starts at 2.0 ...
+            ll_http.time.monotonic()  # ... and ends at 15.0, past the deadline
+            return [fake_address_entry("192.0.2.10")]
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append(timeout)
+            raise AssertionError("connect attempted although the deadline was already spent")
+
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[2.0, 15.0, 15.0, 15.0]
+        ):
+            with self.assertRaises(ll_http.RequestDeadlineExceeded):
+                self._connection().connect()
+
+        self.assertEqual(attempts, [])
+
+    def test_empty_resolution_list_is_a_connection_error(self):
+        attempts = []
+
+        def resolve(host, port):
+            return []
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append(timeout)
+            raise AssertionError("connect attempted for an empty address list")
+
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[1.0, 1.0]
+        ):
+            with self.assertRaises(OSError) as ctx:
+                self._connection().connect()
+
+        # Matches socket.create_connection: no addresses is a connection
+        # error, not a deadline event.
+        self.assertEqual(str(ctx.exception), "getaddrinfo returns an empty list")
+        self.assertEqual(attempts, [])
+
+    def test_all_addresses_failing_surfaces_last_connection_error(self):
+        entries = [fake_address_entry("192.0.2.10"), fake_address_entry("192.0.2.11")]
+        attempts = []
+
+        def resolve(host, port):
+            return entries
+
+        def connect_one(entry, timeout, source_address):
+            attempts.append(timeout)
+            raise ConnectionRefusedError()
+
+        with mock.patch.object(ll_http, "_resolve_addresses", resolve), mock.patch.object(
+            ll_http, "_connect_address", connect_one
+        ), mock.patch.object(
+            ll_http.time, "monotonic", side_effect=[0.0, 1.0, 1.0, 1.0]
+        ):
+            with self.assertRaises(ll_http.TransportError) as ctx:
+                self._transport().get("chatgpt.com", "/p", {})
+
+        # The last connection error surfaces, sanitized to its class name,
+        # exactly as socket.create_connection's last-error behavior did.
+        self.assertEqual(str(ctx.exception), "network error (ConnectionRefusedError)")
+        self.assertEqual(attempts, [9.0, 9.0])
 
 
 class DefaultTlsContextTests(TransportHarness):
