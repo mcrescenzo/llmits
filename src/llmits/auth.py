@@ -303,6 +303,9 @@ def _codex_sources(cli_path: str | None) -> tuple[CredentialSource, ...]:
     override = os.environ.get("LLMITS_CODEX_CREDENTIALS")
     if override:
         paths.append(Path(override).expanduser())
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        paths.append(Path(codex_home).expanduser() / "auth.json")
     paths.append(Path.home() / ".codex" / "auth.json")
     return tuple(
         _strict_json_source(

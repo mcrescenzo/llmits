@@ -358,6 +358,32 @@ class CodexCredentialTests(IsolatedHomeMixin, unittest.TestCase):
         os.environ["LLMITS_CODEX_CREDENTIALS"] = str(env_file)
         self.assertEqual(auth.read_codex_token(str(cli_file)), SENTINEL)
 
+    def test_codex_home_relocates_the_auth_file(self):
+        codex_home = self.tmp / "codex-home"
+        codex_home.mkdir()
+        os.environ["CODEX_HOME"] = str(codex_home)
+        make_creds(codex_home, "auth.json", self.payload())
+        make_creds(self.tmp, ".codex/auth.json", {"tokens": {"access_token": DECOY}})
+        self.assertEqual(auth.read_codex_token(), SENTINEL)
+
+    def test_codex_home_without_auth_file_falls_back_to_default_home(self):
+        codex_home = self.tmp / "codex-home"
+        codex_home.mkdir()
+        os.environ["CODEX_HOME"] = str(codex_home)
+        make_creds(self.tmp, ".codex/auth.json", self.payload())
+        self.assertEqual(auth.read_codex_token(), SENTINEL)
+
+    def test_explicit_overrides_beat_codex_home(self):
+        codex_home = self.tmp / "codex-home"
+        codex_home.mkdir()
+        os.environ["CODEX_HOME"] = str(codex_home)
+        make_creds(codex_home, "auth.json", {"tokens": {"access_token": DECOY}})
+        env_file = make_creds(self.tmp, "env.json", self.payload())
+        os.environ["LLMITS_CODEX_CREDENTIALS"] = str(env_file)
+        self.assertEqual(auth.read_codex_token(), SENTINEL)
+        cli_file = make_creds(self.tmp, "cli.json", {"tokens": {"access_token": "other"}})
+        self.assertEqual(auth.read_codex_token(str(cli_file)), "other")
+
     def test_missing_everywhere_is_actionable(self):
         with self.assertRaises(auth.CredentialError) as ctx:
             auth.read_codex_token()
