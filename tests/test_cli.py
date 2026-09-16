@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import sys
@@ -41,6 +42,26 @@ class OkTransport:
 class FailTransport:
     def get(self, host, path, headers):
         return Response(401, b"denied")
+
+
+class HeaderCheckingTransport:
+    """Drives request headers through the real http.client header writer.
+
+    ``putheader`` only buffers the header block (the connection is never
+    opened or sent), so this reproduces exactly the production encoding
+    failure for a token that cannot be a header value, with no network.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def get(self, host, path, headers):
+        self.calls.append((host, path))
+        conn = http.client.HTTPConnection("unused.invalid")
+        conn.putrequest("GET", path)
+        for name, value in headers.items():
+            conn.putheader(name, value)
+        return Response(200, (FIXTURES / "claude_usage_full.json").read_bytes())
 
 
 def readers(token=SENTINEL):
@@ -321,6 +342,48 @@ class SymlinkCredentialTests(unittest.TestCase):
         self.assertEqual(by_provider["codex"]["status"], "auth_required")
         self.assertEqual(by_provider["zai"]["status"], "auth_required")
         self.assertNotIn(str(link), out.getvalue())
+
+
+class MalformedCredentialTokenTests(unittest.TestCase):
+    """A Claude access token http.client cannot send as a header value
+    (embedded CR/LF, non-latin-1 text) must surface as a credential failure
+    (auth_required) with sanitized output — never as a parse_error "internal
+    provider error (ValueError)" and never leaking the token or file path.
+    """
+
+    def test_header_unencodable_token_fails_auth_required_not_parse_error(self):
+        original_env = dict(os.environ)
+        tmp = isolated_home()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(lambda: os.environ.clear() or os.environ.update(original_env))
+        for label, suffix in (("embedded crlf", "\r\ninjected-header"), ("non-latin-1", "\u4e2d")):
+            with self.subTest(label=label):
+                creds = Path(tmp.name) / "creds.json"
+                creds.write_text(
+                    json.dumps({"claudeAiOauth": {"accessToken": SENTINEL + suffix}})
+                )
+                os.chmod(creds, 0o600)
+
+                transport = HeaderCheckingTransport()
+                out, err = StringIO(), StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = cli.main(
+                        ["--json", "--providers", "claude", "--claude-credentials", str(creds)],
+                        transport_factory=lambda: transport,
+                        credential_readers=None,
+                    )
+                self.assertEqual(code, 1, err.getvalue())
+                self.assertEqual(transport.calls, [])  # no request is ever attempted
+                document = json.loads(out.getvalue())
+                provider = document["providers"][0]
+                self.assertEqual(provider["status"], "auth_required")
+                self.assertNotEqual(provider["status"], "parse_error")
+                self.assertIn("claude login", provider["error"]["action"])
+                combined = out.getvalue() + err.getvalue()
+                self.assertNotIn(SENTINEL, combined)
+                self.assertNotIn("injected-header", combined)
+                self.assertNotIn("\u4e2d", combined)
+                self.assertNotIn(str(creds), combined)
 
 
 class FatalInternalErrorTests(unittest.TestCase):
