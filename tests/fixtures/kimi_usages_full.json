@@ -1,14 +1,15 @@
 {
-  "usage": {"limit": "300", "remaining": "174", "resetTime": "2026-07-16T10:00:00Z"},
+  "usage": {"limit": "300", "remaining": "174", "used": "invented-usage-used", "resetTime": "2026-07-16T10:00:00Z"},
   "limits": [
     {
       "duration": "300",
       "timeUnit": "TIME_UNIT_MINUTE",
-      "detail": {"limit": "6000", "remaining": "3480", "resetTime": "2026-07-14T15:00:00Z"}
+      "name": "invented-limit-name",
+      "detail": {"limit": "6000", "remaining": "3480", "used": "invented-detail-used", "resetTime": "2026-07-14T15:00:00Z"}
     }
   ],
   "totalQuota": {"monthlyLimit": 9000, "used": 1200},
   "parallel": {"limit": 3},
-  "user": {"userId": "invented-user-1", "region": "REGION_OVERSEA", "membership": "invented-pro"},
+  "user": {"userId": "invented-user-1", "region": "invented-region", "membership": "invented-pro"},
   "unknown_future_field": {"x": 1}
 }

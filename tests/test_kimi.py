@@ -1,4 +1,5 @@
 """Kimi Coding Plan adapter tests (invented fixtures; no live requests)."""
+import dataclasses
 import json
 import unittest
 from datetime import datetime, timezone
@@ -12,9 +13,51 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SENTINEL = "kimi-sentinel-key"
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
 
+# One invented sentinel per identifier-like payload field in
+# kimi_usages_full.json, so a failing leak assertion names the leaking field.
+# The two "used" values sit in fields the parser reads today (their
+# non-numeric strings are tolerated, so the counts stay derived from
+# limit - remaining); the rest are label-like extras or documented-but-dropped
+# concepts the parser never reads. limits[0].timeUnit deliberately keeps a
+# real value: the parser consumes it to select the 5h window, so poisoning it
+# would change the parse outcome instead of only the leak surface.
+PAYLOAD_SENTINELS = (
+    "invented-user-1",  # user.userId (ignored)
+    "invented-pro",  # user.membership (ignored)
+    "invented-region",  # user.region (ignored)
+    "invented-limit-name",  # limits[0].name (ignored)
+    "invented-usage-used",  # usage.used (consumed)
+    "invented-detail-used",  # limits[0].detail.used (consumed)
+)
+
 
 def fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text())
+
+
+def _strings(value) -> list[str]:
+    """Every string reachable in a snapshot (or window tuple), recursively.
+
+    ProviderSnapshot, QuotaWindow, and ProviderError hold all user-visible
+    text as string fields (plan name, window keys and labels, error
+    message/action); fixed enum members (provider, status, error code)
+    stringify and are collected too, and every other field is a number,
+    datetime, boolean, or None. Walking the dataclasses generically
+    instead of naming fields keeps the leak assertions complete: a string
+    field added to these types later is collected automatically instead
+    of silently escaping the check.
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return [
+            text
+            for field in dataclasses.fields(value)
+            for text in _strings(getattr(value, field.name))
+        ]
+    return []
 
 
 class Response:
@@ -211,6 +254,14 @@ class KimiParseTests(unittest.TestCase):
         payload = fixture("kimi_usages_full.json")
         windows = kimi.parse_usage(payload)
         self.assertEqual([w.key for w in windows], ["5h", "weekly"])
+        self.assertEqual([w.label for w in windows], ["5h", "7d"])
+        for sentinel in PAYLOAD_SENTINELS:
+            for text in _strings(windows):
+                with self.subTest(sentinel=sentinel, text=text):
+                    self.assertNotIn(sentinel, text)
+        # Guard against a vacuously passing loop: the collector must have
+        # observed every user-visible string on these windows.
+        self.assertEqual(set(_strings(windows)), {"5h", "7d", "weekly"})
 
 
 class KimiFetchTests(unittest.TestCase):
@@ -227,12 +278,31 @@ class KimiFetchTests(unittest.TestCase):
         self.assertEqual(snapshot.provider, "kimi")
         self.assertEqual(snapshot.plan_name, "Kimi Coding Plan")
         self.assertEqual(snapshot.fetched_at, NOW)
-        # The payload's account identifiers never survive the adapter.
-        flat = snapshot.plan_name or ""
-        self.assertNotIn("invented-user-1", flat)
         (host, path, headers), = transport.calls
         self.assertEqual((host, path), (kimi.HOST, kimi.PATH))
         self.assertEqual(headers["Authorization"], f"Bearer {SENTINEL}")
+
+    def test_payload_identifiers_never_reach_user_visible_text(self):
+        # Every user-visible string this adapter emits is a local constant,
+        # so this cannot fail today; it exists to catch a future regression
+        # that maps a payload field into a plan name, window key/label, or
+        # error message/action. The fixture carries one invented sentinel
+        # per field (see PAYLOAD_SENTINELS), including fields the parser
+        # consumes, so the failing subTest names the leaking field.
+        snapshot, _ = self._fetch(
+            Response(200, (FIXTURES / "kimi_usages_full.json").read_bytes())
+        )
+        self.assertEqual(snapshot.status, AVAILABLE)
+        for sentinel in PAYLOAD_SENTINELS:
+            for text in _strings(snapshot):
+                with self.subTest(sentinel=sentinel, text=text):
+                    self.assertNotIn(sentinel, text)
+        # Guard against a vacuously passing loop: the helper must have
+        # observed every user-visible surface of this snapshot.
+        self.assertEqual(
+            set(_strings(snapshot)),
+            {"kimi", "available", "Kimi Coding Plan", "5h", "weekly", "7d"},
+        )
 
     def test_empty_object_fails_closed_to_parse_error(self):
         snapshot, _ = self._fetch(Response(200, b"{}"))
@@ -240,8 +310,46 @@ class KimiFetchTests(unittest.TestCase):
         self.assertIsNone(snapshot.plan_name)
 
     def test_recognizable_shape_absent_is_parse_error_not_guess(self):
-        snapshot, _ = self._fetch(Response(200, b'{"usage": {"limit": "0"}}'))
+        # No usable windows, on a body carrying the same hostile sentinels:
+        # the parse error must not quote them either.
+        body = json.dumps(
+            {
+                "usage": {"limit": "0", "used": "invented-usage-used"},
+                "limits": [
+                    {
+                        "duration": "300",
+                        "timeUnit": "TIME_UNIT_MINUTE",
+                        "name": "invented-limit-name",
+                        "detail": {"limit": "0", "used": "invented-detail-used"},
+                    }
+                ],
+                "user": {
+                    "userId": "invented-user-1",
+                    "region": "invented-region",
+                    "membership": "invented-pro",
+                },
+            }
+        ).encode()
+        snapshot, _ = self._fetch(Response(200, body))
         self.assertEqual(snapshot.status, PARSE_ERROR)
+        self.assertIsNone(snapshot.plan_name)
+        self.assertEqual(snapshot.windows, ())
+        for sentinel in PAYLOAD_SENTINELS:
+            for text in _strings(snapshot):
+                with self.subTest(sentinel=sentinel, text=text):
+                    self.assertNotIn(sentinel, text)
+        # Guard against a vacuously passing loop on the error surface too:
+        # the collector must have observed the error message and action.
+        self.assertIsNotNone(snapshot.error)
+        self.assertEqual(
+            set(_strings(snapshot)),
+            {
+                "kimi",
+                "parse_error",
+                "no usage data in Kimi response",
+                "the provider API may have changed; check for a newer llmits release",
+            },
+        )
 
     def test_auth_rejection_is_auth_required_without_body(self):
         body = b'{"error": "bad kimi-sentinel-key"}'
