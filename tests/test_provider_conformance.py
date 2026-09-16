@@ -136,9 +136,18 @@ def _case(module) -> ProviderCase:
 
 
 def _texts(snapshot) -> list[str]:
+    # Every user-visible free-text field of the normalized snapshot types:
+    # plan_name, each window's key and label, and the error message/action.
+    # The remaining fields are numeric, datetime, boolean, None, or strings
+    # from a closed vocabulary validated at construction (status, error.code)
+    # plus the adapter's compile-time provider id, so none can carry raw
+    # provider-derived text.
     texts = []
     if snapshot.plan_name:
         texts.append(snapshot.plan_name)
+    for window in snapshot.windows:
+        texts.append(window.key)
+        texts.append(window.label)
     if snapshot.error is not None:
         texts.extend((snapshot.error.message, snapshot.error.action))
     return texts
@@ -179,9 +188,12 @@ class ProviderConformanceTests(unittest.TestCase):
         for provider_id in PROVIDER_IDS:
             with self.subTest(provider=provider_id):
                 case = CASES[provider_id]
-                transport = ScriptedTransport(
-                    lambda *_: Response(200, b"\xff\xfe not json at all")
-                )
+                # Invalid UTF-8 (the \xff\xfe lead bytes) carrying the leak
+                # sentinel as plain ASCII: the body stays malformed for every
+                # adapter's decode path, so any raw-body excerpt echoed into
+                # the normalized snapshot text trips the sentinel assertion.
+                body = b"\xff\xfe " + BODY_SENTINEL.encode()
+                transport = ScriptedTransport(lambda *_: Response(200, body))
                 snapshot = case.module.fetch(SENTINEL, transport, now=NOW)
                 self.assertEqual(snapshot.status, PARSE_ERROR)
                 self.assertIsNone(snapshot.plan_name)
