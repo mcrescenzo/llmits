@@ -182,10 +182,76 @@ class PublicHistoryTests(GitProbeMixin, unittest.TestCase):
     def test_output_must_be_new_and_outside_source(self) -> None:
         existing = self.root / "existing"
         existing.mkdir()
+        marker = existing / "keep.txt"
+        marker.write_bytes(b"untouched\n")
         with self.assertRaisesRegex(RuntimeError, "already exists"):
             public_history.build_candidate(existing)
+        # A pre-existing directory belongs to the caller, so the refusal must
+        # leave it and its contents completely alone; cleanup applies only to
+        # the partial candidates this tool itself creates.
+        self.assertEqual(list(existing.iterdir()), [marker])
+        self.assertEqual(marker.read_bytes(), b"untouched\n")
+        existing_file = self.root / "existing-file"
+        existing_file.write_bytes(b"keep\n")
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            public_history.build_candidate(existing_file)
+        self.assertEqual(existing_file.read_bytes(), b"keep\n")
         with self.assertRaisesRegex(RuntimeError, "outside the source"):
             public_history.build_candidate(REPO_ROOT / "dist" / "candidate")
+
+    def test_late_gate_failure_cleans_partial_candidate_and_retry_succeeds(self) -> None:
+        # A prohibited literal is assembled, never written whole, so this
+        # test file itself can never trip the scanner's own rules.
+        prohibited = b"router at " + b"192." + b"168.10.2" + b"\n"
+        source = self.init_repo("source", {"LICENSE": b"MIT License\n", "notes.md": prohibited})
+        output = self.root / "candidate"
+        before = public_history._source_state(source)
+
+        # scan_candidate runs only after the whole candidate repository has
+        # been written, so this failure arrives at the latest possible gate.
+        with self.assertRaisesRegex(RuntimeError, "candidate scan failed"):
+            public_history.build_candidate(output, source)
+
+        self.assertFalse(output.exists(), "failed build left a blocking candidate behind")
+        self.assertEqual(public_history._source_state(source), before)
+
+        self.git(source, "rm", "--quiet", "notes.md")
+        self.git(source, "commit", "--quiet", "-m", "drop prohibited note")
+        report = public_history.build_candidate(output, source)
+        self.assertEqual(report["scan_findings"], [])
+        self.assertTrue((output / "LICENSE").is_file())
+
+    def test_mid_write_failure_cleans_partial_candidate(self) -> None:
+        source = self.init_repo(
+            "source", {"LICENSE": b"MIT License\n", "README.md": b"# Example\n"}
+        )
+        output = self.root / "candidate"
+        before = public_history._source_state(source)
+        real_git = public_history._git
+
+        def fail_at_hash_object(repo, *args, input_bytes=None, env=None):
+            # The output directory and its files already exist when the first
+            # hash-object runs, so the failure is squarely mid-write; other
+            # plumbing, including the pre-mkdir source snapshots, passes through.
+            if args and args[0] == "hash-object":
+                raise failure("synthetic mid-write failure")
+            return real_git(repo, *args, input_bytes=input_bytes, env=env)
+
+        # KeyboardInterrupt and SystemExit are BaseException, not Exception,
+        # so every iteration proves an interrupt cannot strand a candidate.
+        for failure in (OSError, KeyboardInterrupt, SystemExit):
+            with self.subTest(failure=failure.__name__):
+                with mock.patch.object(public_history, "_git", side_effect=fail_at_hash_object):
+                    with self.assertRaises(failure) as caught:
+                        public_history.build_candidate(output, source)
+                # The original exception propagates with its type and message.
+                self.assertEqual(str(caught.exception), "synthetic mid-write failure")
+                self.assertFalse(output.exists())
+                self.assertEqual(public_history._source_state(source), before)
+
+        # The requested path is reusable with no manual cleanup.
+        report = public_history.build_candidate(output, source)
+        self.assertEqual(report["scan_findings"], [])
 
     def test_candidate_os_error_is_one_line_without_traceback(self) -> None:
         stderr = io.StringIO()

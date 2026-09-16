@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -492,60 +493,78 @@ def build_candidate(output: Path, source: Path = REPO_ROOT) -> dict[str, object]
     before = _source_state(source)
     manifest = source_manifest(source)
     output.mkdir(parents=True, mode=0o700)
-    for item in manifest:
-        target = output / item.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(item.data)
-        target.chmod(item.mode & 0o777)
+    # The refusal above means nothing existed at ``output`` when this call
+    # started, so everything under it is this call's own work. Every failure
+    # from here on — a mid-write OSError, a failed gate, KeyboardInterrupt,
+    # SystemExit — removes exactly that partial candidate and re-raises
+    # unchanged; otherwise the caller is left deleting a stranded artifact
+    # before the next run can proceed.
+    try:
+        for item in manifest:
+            target = output / item.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(item.data)
+            target.chmod(item.mode & 0o777)
 
-    git_env = _git_env(identity=True)
-    _git(
-        output,
-        "init",
-        "--quiet",
-        f"--initial-branch={PUBLIC_BRANCH}",
-        "--object-format=sha1",
-        "--template=",
-        env=git_env,
-    )
-    for item in manifest:
-        object_id = _git(output, "hash-object", "-w", "--stdin", input_bytes=item.data, env=git_env)
-        object_id_text = object_id.decode("ascii").strip()
+        git_env = _git_env(identity=True)
         _git(
             output,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"{item.mode:o},{object_id_text},{item.path}",
+            "init",
+            "--quiet",
+            f"--initial-branch={PUBLIC_BRANCH}",
+            "--object-format=sha1",
+            "--template=",
             env=git_env,
         )
-    tree = _git(output, "write-tree", env=git_env).decode("ascii").strip()
-    commit = _git(
-        output,
-        "-c",
-        "commit.gpgSign=false",
-        "commit-tree",
-        tree,
-        input_bytes=COMMIT_MESSAGE.encode("utf-8"),
-        env=git_env,
-    ).decode("ascii").strip()
-    _git(output, "update-ref", f"refs/heads/{PUBLIC_BRANCH}", commit, env=git_env)
-    _git(output, "symbolic-ref", "HEAD", f"refs/heads/{PUBLIC_BRANCH}", env=git_env)
+        for item in manifest:
+            object_id = _git(
+                output, "hash-object", "-w", "--stdin", input_bytes=item.data, env=git_env
+            )
+            object_id_text = object_id.decode("ascii").strip()
+            _git(
+                output,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"{item.mode:o},{object_id_text},{item.path}",
+                env=git_env,
+            )
+        tree = _git(output, "write-tree", env=git_env).decode("ascii").strip()
+        commit = _git(
+            output,
+            "-c",
+            "commit.gpgSign=false",
+            "commit-tree",
+            tree,
+            input_bytes=COMMIT_MESSAGE.encode("utf-8"),
+            env=git_env,
+        ).decode("ascii").strip()
+        _git(output, "update-ref", f"refs/heads/{PUBLIC_BRANCH}", commit, env=git_env)
+        _git(output, "symbolic-ref", "HEAD", f"refs/heads/{PUBLIC_BRANCH}", env=git_env)
 
-    identity = _git(output, "show", "-s", "--format=%an%n%ae%n%cn%n%ce%n%P", "HEAD")
-    expected_identity = f"{PUBLIC_NAME}\n{PUBLIC_EMAIL}\n{PUBLIC_NAME}\n{PUBLIC_EMAIL}\n\n".encode()
-    if identity != expected_identity:
-        raise RuntimeError("candidate identity or root-parent verification failed")
-    if _git(output, "remote"):
-        raise RuntimeError("candidate unexpectedly has a configured remote")
-    findings = scan_candidate(output)
-    if findings:
-        summary = ", ".join(f"{finding.rule} in {finding.location}" for finding in findings)
-        raise RuntimeError(f"candidate scan failed: {summary}")
-    if _source_state(source) != before:
-        raise RuntimeError(
-            "source repository refs, remotes, or index changed during candidate generation"
+        identity = _git(output, "show", "-s", "--format=%an%n%ae%n%cn%n%ce%n%P", "HEAD")
+        expected_identity = (
+            f"{PUBLIC_NAME}\n{PUBLIC_EMAIL}\n{PUBLIC_NAME}\n{PUBLIC_EMAIL}\n\n".encode()
         )
+        if identity != expected_identity:
+            raise RuntimeError("candidate identity or root-parent verification failed")
+        if _git(output, "remote"):
+            raise RuntimeError("candidate unexpectedly has a configured remote")
+        findings = scan_candidate(output)
+        if findings:
+            summary = ", ".join(f"{finding.rule} in {finding.location}" for finding in findings)
+            raise RuntimeError(f"candidate scan failed: {summary}")
+        if _source_state(source) != before:
+            raise RuntimeError(
+                "source repository refs, remotes, or index changed during candidate generation"
+            )
+    except BaseException:
+        # Best-effort removal: a cleanup OSError must never mask the original
+        # failure (a second interrupt delivered during cleanup still
+        # propagates on its own). rmtree refuses to traverse a symlink, so
+        # this can only delete files that this call created.
+        shutil.rmtree(output, ignore_errors=True)
+        raise
 
     license_entry = next(item for item in manifest if item.path == "LICENSE")
     return {
