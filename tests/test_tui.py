@@ -1787,10 +1787,24 @@ class FakeScreen:
 class RuntimeTests(unittest.TestCase):
     """run_tui/_draw driven through a fake screen (folded finding rank 14)."""
 
-    def _run(self, screen, service=None, refresh_seconds=0, color_count=256):
+    def _run(
+        self, screen, service=None, refresh_seconds=0, color_count=256, patch_set_escdelay=True
+    ):
+        """Drive run_tui through a fake screen; returns its exit code.
+
+        ``patch_set_escdelay=False`` leaves the real ``curses.set_escdelay``
+        attribute alone so a test can hold it at None or delete it and hit
+        run_tui's absent-or-None guard instead of a MagicMock.
+        """
+        from contextlib import nullcontext
         from unittest.mock import patch
 
         service = service or InstantService()
+        escdelay = (
+            patch.object(curses, "set_escdelay", create=True)
+            if patch_set_escdelay
+            else nullcontext()
+        )
         with patch.object(curses, "has_colors", return_value=True), patch.object(
             curses, "start_color"
         ), patch.object(curses, "use_default_colors"), patch.object(
@@ -1803,9 +1817,7 @@ class RuntimeTests(unittest.TestCase):
             curses, "COLORS", color_count, create=True
         ), patch.object(
             tui, "_build_attrs", wraps=tui._build_attrs
-        ) as mock_build_attrs, patch.object(
-            curses, "set_escdelay", create=True
-        ) as mock_escdelay:
+        ) as mock_build_attrs, escdelay as mock_escdelay:
             code = tui.run_tui(screen, service, refresh_seconds)
         self.last_escdelay = mock_escdelay
         return code, mock_init_pair, mock_build_attrs
@@ -1820,12 +1832,42 @@ class RuntimeTests(unittest.TestCase):
         self.assertLessEqual(delay, 50)
 
     def test_missing_set_escdelay_does_not_abort_startup(self):
+        # llmits-50s: run_tui's guard getattr(curses, "set_escdelay", None)
+        # covers two unsupported shapes and must skip the delay call in
+        # both. _run's set_escdelay patch is disabled here because it would
+        # replace the intended None/absent attribute with a MagicMock and
+        # make this test vacuous: an unconditional call would then be
+        # invisible instead of aborting startup.
         from unittest.mock import patch
 
+        # (a) Attribute present but None: it cannot be called, so a clean
+        # exit proves the call was skipped (calling None raises TypeError
+        # and aborts run_tui).
         screen = FakeScreen(height=24, width=80, keys=[ord("q")])
         with patch.object(curses, "set_escdelay", None, create=True):
-            code, _, _ = self._run(screen)
+            code, _, _ = self._run(screen, patch_set_escdelay=False)
+            self.assertIsNone(curses.set_escdelay)
         self.assertEqual(code, 0)
+
+        # (b) Attribute genuinely absent, as on old curses builds: calling
+        # it raises AttributeError. Delete it for the duration of the run
+        # only, and restore whatever was there before (or nothing at all)
+        # even if an assertion fails.
+        missing = object()
+        original = getattr(curses, "set_escdelay", missing)
+        if original is not missing:
+            del curses.set_escdelay
+        try:
+            self.assertFalse(hasattr(curses, "set_escdelay"))
+            screen = FakeScreen(height=24, width=80, keys=[ord("q")])
+            code, _, _ = self._run(screen, patch_set_escdelay=False)
+            self.assertEqual(code, 0)
+            self.assertFalse(hasattr(curses, "set_escdelay"))
+        finally:
+            if original is not missing:
+                curses.set_escdelay = original
+            elif hasattr(curses, "set_escdelay"):
+                del curses.set_escdelay
 
     def test_pressing_q_quits_and_returns_zero(self):
         screen = FakeScreen(height=24, width=80, keys=[ord("q")])
