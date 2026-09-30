@@ -59,7 +59,7 @@ Install the tracked pre-push gate once per clone:
 make install-hooks
 ```
 
-This sets `core.hooksPath` to `.githooks/`, so `git push` runs the complete release gate, whose dependency graph includes the full-history scan exactly once. Hooks are bypassable with `git push --no-verify`, so they are defense in depth for the person pushing; continuous integration is the authoritative boundary.
+This sets `core.hooksPath` to `.githooks/`, so `git push` runs the complete release gate, whose dependency graph includes the full-history scan exactly once. Hooks are local and bypassable with `git push --no-verify`; run `make release-check` explicitly before offering a change for review. This repository does not run hosted CI.
 
 ## Change guidelines
 
@@ -77,7 +77,7 @@ Bugs, regressions, and feature requests are tracked publicly in [GitHub Issues](
 
 ## Pull requests
 
-A pull request should explain the user-visible or security-relevant effect, list the exact validation commands run, and call out any check that could not be run. Keep unrelated formatting or refactoring out of the same change. CI must pass on every supported Python version before merge.
+A pull request should explain the user-visible or security-relevant effect, list the exact local validation commands run, and call out any check that could not be run. Keep unrelated formatting or refactoring out of the same change. Reviewers should verify local release-check evidence before merging; hosted checks are not configured.
 
 ## Preparing a public-history candidate
 

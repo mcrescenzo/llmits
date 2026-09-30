@@ -87,7 +87,7 @@ These hosting safeguards and release checks recur: verify them before every rele
 
 - [ ] Confirm private vulnerability reporting is enabled and the advisory form is reachable.
 - [ ] Confirm GitHub secret scanning and push protection are enabled for the repository.
-- [ ] Protect the release branch and require the pinned Python 3.11–3.14 CI matrix, which checks out full history (`fetch-depth: 0`) and runs the history scan through `make release-check`.
+- [ ] Protect the release branch with pull-request review; do not require hosted CI status checks. Verify the local release-gate evidence before merging.
 - [ ] Run `make release-check` — which includes `make history-check`, the full-ancestry scan of commit messages, historical paths, and every unique reachable blob — from a clean checkout and record the resulting artifact SHA-256.
 - [ ] Build the artifact a second time, confirm the bytes and checksum match, and inspect `llmits/LICENSE` in the archive.
 - [ ] Run `make public-history OUTPUT=/path/outside/repository` twice and confirm both candidate commit IDs match; retain its clean-history scan report for review.

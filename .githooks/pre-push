@@ -2,8 +2,8 @@
 # Tracked pre-push gate: the complete release gate, including the full-history
 # scan, executed exactly once through Make's dependency graph.
 #
-# Defense in depth for the person pushing, not the authoritative boundary --
-# continuous integration is. Install once per clone with: make install-hooks
+# Local and bypassable: reviewers must verify release-gate evidence before
+# merging. Install once per clone with: make install-hooks
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

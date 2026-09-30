@@ -89,7 +89,7 @@ def _write_archive(output: Path, staging: Path, entrypoint: str) -> None:
 def nondeterministic_entries(archive: zipfile.ZipFile) -> list[str]:
     """Return entry names (or "(entry order)") violating the reproducibility contract.
 
-    Reusable by CI and final verification: an empty result means every entry
+    Reusable by the local release gate: an empty result means every entry
     carries the fixed timestamp, Unix create_system, and normalized mode, and
     ``__main__.py`` precedes the path-sorted package entries.
     """
