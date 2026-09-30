@@ -38,7 +38,7 @@ make public-history OUTPUT=/tmp/llmits-public-history  # isolated clean-root can
 
 The repository history is public. Commit with a GitHub no-reply identity (see
 CONTRIBUTING.md), never commit credentials or machine-local state, and run
-`make install-hooks` once per clone so pushes run the same history gate and
-release check as CI. Track public work in GitHub Issues.
+`make install-hooks` once per clone so pushes run the complete local history gate
+and release check. Track public work in GitHub Issues.
 
 Security-sensitive findings belong in the private reporting channel documented in [SECURITY.md](SECURITY.md), not in public issues or test fixtures.
